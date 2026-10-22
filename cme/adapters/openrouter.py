@@ -51,6 +51,16 @@ def extract_json(text: str):
     return None
 
 
+def _safe_response_excerpt(content: str, limit: int = 400) -> str:
+    """Return a short model-output sample for diagnostics without exposing common API-key forms."""
+    excerpt = str(content or "")
+    excerpt = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]", excerpt)
+    excerpt = re.sub(
+        r"(?i)\bsk-(?:or-v1|proj|ant|live)-[A-Za-z0-9_-]{8,}|\bsk-[A-Za-z0-9_-]{20,}",
+        "[REDACTED]", excerpt)
+    return re.sub(r"\s+", " ", excerpt).strip()[:limit]
+
+
 def _format(params):
     mode = params.get("response_format_mode", "json_object")
     if mode == "json_schema":
@@ -98,10 +108,17 @@ def make_openrouter_judge(params: dict, api_key=None, transport=None):
         out = {}
         requested_ids = {a.id for a in atoms}
         rows = data.get("results") if isinstance(data, dict) else None
+        matching_rows = []
+        duplicate_ids = []
+        rows_invalid_pass = 0
+        rows_missing_evidence = 0
         if isinstance(rows, list):
             ids = [r.get("id") for r in rows if isinstance(r, dict) and isinstance(r.get("id"), str)
                    and r.get("id") in requested_ids]
             counts = Counter(ids)
+            duplicate_ids = sorted(rid for rid, count in counts.items() if count > 1)
+            matching_rows = [r for r in rows if isinstance(r, dict)
+                             and isinstance(r.get("id"), str) and r.get("id") in requested_ids]
             for r in rows:
                 if not isinstance(r, dict) or not isinstance(r.get("id"), str):
                     continue
@@ -110,8 +127,46 @@ def make_openrouter_judge(params: dict, api_key=None, transport=None):
                     continue
                 # A duplicated ID is ambiguous: omit every occurrence rather than keeping the last one.
                 if counts[rid] != 1 or type(passed) is not bool or not isinstance(evidence, str) or not evidence.strip():
+                    if type(passed) is not bool:
+                        rows_invalid_pass += 1
+                    if not isinstance(evidence, str) or not evidence.strip():
+                        rows_missing_evidence += 1
                     continue
                 out[rid] = {"pass": passed, "evidence": evidence.strip()[:120]}
+
+        # Incomplete results remain NOT_RUN, but now the call log explains why parsing failed.
+        if len(out) != len(requested_ids):
+            if not str(content or "").strip():
+                reason = "empty_response"
+            elif data is None:
+                reason = "invalid_json"
+            elif not isinstance(data, dict):
+                reason = "json_root_not_object"
+            elif not isinstance(rows, list):
+                reason = "missing_results_list"
+            elif not rows:
+                reason = "empty_results_list"
+            elif not matching_rows:
+                reason = "no_requested_ids_in_results"
+            elif not out:
+                reason = "all_matching_rows_rejected"
+            else:
+                reason = "partial_results"
+            meta = {
+                **meta,
+                "diagnostic": {
+                    "component": "openrouter_judge",
+                    "reason": reason,
+                    "expected_ids": len(requested_ids),
+                    "valid_ids": len(out),
+                    "matching_rows": len(matching_rows),
+                    "duplicate_ids": duplicate_ids[:10],
+                    "rows_invalid_pass": rows_invalid_pass,
+                    "rows_missing_evidence": rows_missing_evidence,
+                    "missing_ids": sorted(requested_ids - set(out))[:10],
+                    "response_excerpt": _safe_response_excerpt(content),
+                },
+            }
         return out, meta
 
     return judge
