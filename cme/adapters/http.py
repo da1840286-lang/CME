@@ -8,14 +8,12 @@ from pathlib import Path
 from ..providers import InfraError, ProviderCallError
 
 
-
-
 def _safe_detail(value: str) -> str:
     """Flatten and redact provider-supplied text before adding it to logs/errors."""
     text = " ".join(str(value).split())
-    text = re.sub(r"(?i)\\bsk-or-v1-[A-Za-z0-9_-]{8,}\\b", "[REDACTED]", text)
-    text = re.sub(r"(?i)\\bBearer\\s+\\S+", "Bearer [REDACTED]", text)
-    text = re.sub(r"(?i)\\b(api[_ -]?key|authorization)\\s*[:=]\\s*\\S+", r"\\1=[REDACTED]", text)
+    text = re.sub(r"(?i)\bsk-or-v1-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", text)
+    text = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", text)
+    text = re.sub(r"(?i)\b(api[_ -]?key|authorization)\s*[:=]\s*\S+", r"\1=[REDACTED]", text)
     return text[:240]
 
 
