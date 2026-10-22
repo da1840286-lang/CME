@@ -4,7 +4,7 @@
    "name": "openrouter_free_brain",
    "kind": "brain",
    "provider": "openrouter",
-   "model_id": "google/gemma-4-26b-a4b-it:free",
+   "model_id": "qwen/qwen3.8-27b:free",
    "tier": "free",
    "verified": false,
    "params": {
@@ -19,7 +19,7 @@
    "name": "openrouter_free_judge",
    "kind": "judge",
    "provider": "openrouter",
-   "model_id": "google/gemma-4-26b-a4b-it:free",
+   "model_id": "qwen/qwen3.8-27b:free",
    "tier": "free",
    "verified": false,
    "params": {
@@ -34,7 +34,7 @@
    "name": "openrouter_free_analyst",
    "kind": "analyst",
    "provider": "openrouter",
-   "model_id": "google/gemma-4-26b-a4b-it:free",
+   "model_id": "qwen/qwen3.8-27b:free",
    "tier": "free",
    "verified": false,
    "params": {
