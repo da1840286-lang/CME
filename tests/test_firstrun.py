@@ -263,7 +263,8 @@ class JudgeTests(unittest.TestCase):
             judge = make_openrouter_judge({"model_id": "vendor/v:free"}, "k", send)
             out, meta = judge(img, [A("a1", "Product visible"), A("a2", "Hand holding it")])
         content = calls[0]["messages"][1]["content"]
-        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+        image_parts = [part for part in content if isinstance(part, dict) and part.get("type") == "image_url"]
+        self.assertTrue(image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,"))
         self.assertEqual(out, {"a1": {"pass": True, "evidence": "visible"}})  # missing evidence and malformed pass dropped
 
     def test_evidence_free_and_malformed_rows_are_not_pass(self):

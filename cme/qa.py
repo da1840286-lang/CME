@@ -2,8 +2,13 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Sequence
 from PIL import Image, ImageChops, ImageStat
 from .atoms import norm
+
+
+PRODUCT_IDENTITY_CHECK_ID = "cme_product_identity_ref"
+MAX_PRODUCT_REFERENCES_FOR_JUDGE = 3
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,38 @@ def file_check(check_id, path, expected_size=None, required=True) -> CheckResult
     if expected_size and tuple(size) != tuple(expected_size):
         return CheckResult(check_id, "FAIL", required, "code", f"size {size} != {expected_size}")
     return CheckResult(check_id, "PASS", required, "code", f"size {size}")
+
+
+def validate_product_references(paths: Sequence[str | Path]) -> list[str]:
+    """Return blocking issues for missing, unreadable, or obvious flat-color placeholder references.
+
+    This intentionally catches only near-uniform placeholders; it does not claim to judge whether a
+    real product photo is good. The real visual identity comparison runs in the Judge after generation.
+    """
+    issues = []
+    if not paths:
+        return ["no target-product reference photo supplied"]
+    for raw in paths:
+        path = Path(raw)
+        if not path.is_file() or path.stat().st_size == 0:
+            issues.append(f"target-product reference is missing or empty: {path.name}")
+            continue
+        try:
+            with Image.open(path) as opened:
+                im = opened.convert("RGB")
+                if im.width < 64 or im.height < 64:
+                    issues.append(f"target-product reference is too small ({im.width}x{im.height}): {path.name}")
+                    continue
+                im.thumbnail((64, 64))
+                pixel_data = im.get_flattened_data() if hasattr(im, "get_flattened_data") else im.getdata()
+                pixels = list(pixel_data)
+        except Exception as e:
+            issues.append(f"target-product reference cannot be decoded ({type(e).__name__}): {path.name}")
+            continue
+        unique = len(set(pixels))
+        if unique <= 2:
+            issues.append(f"target-product reference is a flat-color placeholder ({unique} unique colours): {path.name}; replace it with a real product photo")
+    return issues
 
 
 def anchor_similarity(check_id, prev_path, cur_path, region, min_similarity=0.85, required=True):
@@ -75,14 +112,22 @@ def judge_checks(path, qa_atoms, judge_fn, required=False):
     return out
 
 
-def judge_batch_checks(path, atoms, judge_fn, required=False):
-    """One judge request per frame; malformed or evidence-free rows are NOT_RUN."""
+def judge_batch_checks(path, atoms, judge_fn, required=False, reference_images=()):
+    """One Judge request per frame; references trigger a separate, required product-identity verdict."""
+    refs = [str(p) for p in list(reference_images or ())[:MAX_PRODUCT_REFERENCES_FOR_JUDGE]]
     try:
-        answers = judge_fn(path, atoms)
+        answers = judge_fn(path, atoms, refs) if refs else judge_fn(path, atoms)
     except Exception as e:
-        return [CheckResult(a.id, "NOT_RUN", required, "judge", f"judge unavailable: {e}") for a in atoms]
+        out = [CheckResult(a.id, "NOT_RUN", required, "judge", f"judge unavailable: {e}") for a in atoms]
+        if refs:
+            out.append(CheckResult(PRODUCT_IDENTITY_CHECK_ID, "NOT_RUN", True, "judge",
+                                   f"product-reference comparison unavailable: {type(e).__name__}: {e}"))
+        return out
     if not isinstance(answers, dict):
-        return [CheckResult(a.id, "NOT_RUN", required, "judge", "malformed judge response") for a in atoms]
+        out = [CheckResult(a.id, "NOT_RUN", required, "judge", "malformed judge response") for a in atoms]
+        if refs:
+            out.append(CheckResult(PRODUCT_IDENTITY_CHECK_ID, "NOT_RUN", True, "judge", "malformed judge response"))
+        return out
     out = []
     for a in atoms:
         r = answers.get(a.id)
@@ -94,17 +139,30 @@ def judge_batch_checks(path, atoms, judge_fn, required=False):
             out.append(CheckResult(a.id, "NOT_RUN", required, "judge", "malformed answer or missing evidence"))
             continue
         out.append(CheckResult(a.id, "PASS" if r["pass"] else "FAIL", required, "judge", evidence.strip()[:120]))
+    if refs:
+        r = answers.get(PRODUCT_IDENTITY_CHECK_ID)
+        if not isinstance(r, dict):
+            out.append(CheckResult(PRODUCT_IDENTITY_CHECK_ID, "NOT_RUN", True, "judge",
+                                   "Judge did not return a product-identity result for the supplied target-photo reference"))
+        else:
+            evidence = r.get("evidence")
+            if type(r.get("pass")) is not bool or not isinstance(evidence, str) or not evidence.strip():
+                out.append(CheckResult(PRODUCT_IDENTITY_CHECK_ID, "NOT_RUN", True, "judge",
+                                       "malformed product-identity answer or missing visual evidence"))
+            else:
+                out.append(CheckResult(PRODUCT_IDENTITY_CHECK_ID, "PASS" if r["pass"] else "FAIL", True,
+                                       "judge", evidence.strip()[:120]))
     return out
 
 
 def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr_required=True,
-                   text_allowed=False, anchors=(), verified_claims=()):
-    """Build QA for one shot. Offer claims are contract-checked, not inferred from pixels."""
+                   text_allowed=False, anchors=(), verified_claims=(), product_references=()):
+    """Build QA for one shot; optional product references add a required identity comparison."""
     claims = [a for a in atoms if a.shot == shot and a.channel == "qa" and a.kind == "claim"]
     claim_set = {norm(c) for c in verified_claims}
-    # A claim atom is an offer-truth record. Visual proof, when needed, is a separate image atom.
     pool = [a for a in atoms if a.shot == shot and a.channel in ("image", "qa")
             and not (a.channel == "qa" and a.kind == "claim")]
+    product_refs = tuple(str(p) for p in list(product_references or ())[:MAX_PRODUCT_REFERENCES_FOR_JUDGE])
 
     def run(path):
         res = [file_check("file", path, expected_size),
@@ -117,8 +175,11 @@ def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr
                 a.id, "PASS" if valid else "FAIL", a.priority == "MUST", "code",
                 "matches verified offer claim; not inferred from pixels" if valid
                 else "claim is absent from offer.verified_claims"))
-        if judge_fn is not None and pool:
-            res.extend(judge_batch_checks(path, pool, judge_fn))
+        if judge_fn is not None and (pool or product_refs):
+            res.extend(judge_batch_checks(path, pool, judge_fn, reference_images=product_refs))
+        elif product_refs:
+            res.append(CheckResult(PRODUCT_IDENTITY_CHECK_ID, "NOT_RUN", True, "judge",
+                                   "no Judge adapter configured; target-product identity was not compared"))
         return res
 
     return run

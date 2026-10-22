@@ -14,11 +14,11 @@ import sys
 import time
 from pathlib import Path
 from .atoms import check_claims, parse_atoms
-from .brain import BrainError, request_atoms
+from .brain import BrainError, build_source_transfer_context, request_atoms
 from .compiler import BudgetError
 from .offer import OfferError, load_offer
 from .providers import CallLog, InfraError, ProviderCallError, ProviderPolicyError
-from .qa import make_qa_checks
+from .qa import make_qa_checks, validate_product_references
 from .registry import SettingsError, load_catalog, load_settings, make_brain_call, make_image_provider, make_judge
 from .run import AttemptLimit, produce_shot
 from .state import StateMismatch, load_state, new_run, save_state
@@ -93,11 +93,20 @@ def atoms_summary(atoms) -> str:
 
 def run_brain(args, offer, settings, catalog, vertical, log, run_id, ctx, out):
     atoms_path, manifest_path = out / "atoms.json", out / "atoms_manifest.json"
+    source_transfer = None
+    if args.source_contract:
+        source_path = Path(args.source_contract)
+        try:
+            source_payload = json.loads(source_path.read_text(encoding="utf-8"))
+            source_transfer = build_source_transfer_context(source_payload)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            # Reject malformed context before touching a previously accepted atom contract.
+            raise BrainError({"#source_contract": [f"cannot load supported source-transfer JSON {source_path}: {e}"]}) from e
     # A failed Brain call must never leave an older contract looking current.
     manifest_path.unlink(missing_ok=True)
     atoms_path.unlink(missing_ok=True)
     call = make_brain_call(settings, catalog, log, run_id, **ctx)
-    atoms = request_atoms(offer, args.brief, args.shots, call, vertical=vertical)
+    atoms = request_atoms(offer, args.brief, args.shots, call, vertical=vertical, source_transfer=source_transfer)
     data = [a.to_dict() for a in atoms]
     atoms_path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     fingerprint, photo_hashes = offer_fingerprint(offer)
@@ -106,6 +115,7 @@ def run_brain(args, offer, settings, catalog, vertical, log, run_id, ctx, out):
                 "photo_hashes": photo_hashes, "contract_id": contract_id_for(data, offer),
                 "requested_shots": args.shots,
                 "brief_sha256": _sha256_bytes(args.brief.encode("utf-8")),
+                "source_contract_sha256": _sha256_bytes(Path(args.source_contract).read_bytes()) if args.source_contract else None,
                 "model_id": call.info.get("model_id"), "responded_model": call.info.get("responded_model")}
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"Brain: {len(atoms)} атомов, модель {call.info.get('model_id')} (ответила: {call.info.get('responded_model') or 'не сообщено'})")
@@ -133,10 +143,16 @@ def run_frame(args, offer, settings, catalog, vertical, log, run_id, ctx, out, a
     state = new_run(run_id, previous, offer.offer_id, contract_id)
     for note in state.carry_notes:
         print("перенос:", note)
+    # The normal CLI (empty ctx) must never spend provider quota on the known solid-colour sample placeholder.
+    # Tests inject a transport/key in ctx and use synthetic fixtures; they exercise the QA logic separately.
+    if not ctx:
+        reference_issues = validate_product_references(offer.photos)
+        if reference_issues:
+            raise OfferError("Product-photo preflight blocked generation: " + "; ".join(reference_issues))
     provider = make_image_provider(settings, catalog, log, run_id, **ctx)
     judge = make_judge(settings, catalog, log, run_id, **ctx) if settings.judge_adapter else None
     qa = make_qa_checks(atoms, args.shot, judge_fn=judge, ocr_required=not args.no_ocr_required,
-                        verified_claims=offer.verified_claims)
+                        verified_claims=offer.verified_claims, product_references=offer.photos)
     refs = [state.shots[args.shot - 1]["image_path"]] if (args.shot - 1) in state.shots else []
     try:
         receipt, compiled, verdict = produce_shot(
@@ -169,6 +185,7 @@ def main(argv=None, ctx=None) -> int:
     ap.add_argument("--vertical", default=str(ROOT / "verticals" / "physical_goods_us.json"))
     ap.add_argument("--out", default="out")
     ap.add_argument("--brief", default=DEFAULT_BRIEF)
+    ap.add_argument("--source-contract", help="Optional old CME source/transfer/rebuild JSON (or saved Radar analysis) to atomize")
     ap.add_argument("--shots", type=int, default=1)
     ap.add_argument("--shot", type=int, default=1)
     ap.add_argument("--attempt", type=int, default=1)

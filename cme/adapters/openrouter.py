@@ -4,6 +4,7 @@ import json
 import os
 import re
 from collections import Counter
+from pathlib import Path
 from ..atoms import ATOM_SCHEMA, KINDS
 from ..providers import InfraError, ProviderCallError
 from .http import check_status, data_uri, urllib_transport
@@ -92,7 +93,7 @@ def make_openrouter_brain(params: dict, api_key=None, transport=None):
                   "and nothing else. Each atom: id, kind, text (max 120 chars), priority (MUST/SHOULD/MAY), "
                   f"channel (image/motion/qa), shot. Allowed kinds: {', '.join(KINDS)}. "
                   + " ".join(request.get("rules", [])) + " JSON schema: " + json.dumps(request["schema"]))
-        user = {k: request.get(k) for k in ("offer", "brief", "shots", "only_fix") if request.get(k) is not None}
+        user = {k: request.get(k) for k in ("offer", "brief", "shots", "only_fix", "source_transfer") if request.get(k) is not None}
         content, meta = _chat(params, api_key, send,
                               [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user)}],
                               _format(params))
@@ -105,22 +106,40 @@ def make_openrouter_brain(params: dict, api_key=None, transport=None):
 
 
 def make_openrouter_judge(params: dict, api_key=None, transport=None):
-    """judge(image_path, atoms) -> ({atom_id: {'pass': bool, 'evidence': str}}, meta). Evidence only."""
+    """Judge one generated frame; optional target-product references enable an identity check in the same call."""
     send = transport or urllib_transport
+    identity_id = "cme_product_identity_ref"
 
-    def judge(image_path, atoms):
-        system = ("You verify one image against numbered requirements. Be strict: if you cannot clearly see "
+    def judge(image_path, atoms, reference_images=()):
+        refs = [Path(p) for p in list(reference_images or ())[:3]]
+        for p in refs:
+            if not p.is_file() or p.stat().st_size == 0:
+                raise ProviderCallError(f"target-product reference is missing or empty: {p.name}")
+        system = ("You verify one generated image against numbered requirements. Be strict: if you cannot clearly see "
                   "the requirement satisfied, answer false. Reply ONLY with JSON "
                   "{\"results\": [{\"id\": \"...\", \"pass\": true|false, \"evidence\": \"<12 words\"}]}.")
         reqs = [{"id": a.id, "requirement": a.text} for a in atoms]
+        if refs:
+            reqs.append({"id": identity_id, "requirement": (
+                "PRODUCT IDENTITY: compare the product visible in the generated frame with the original target-product reference image(s). "
+                "Ignore differences in background, lighting, camera, and composition. PASS only if product silhouette, construction, color, "
+                "and distinctive physical details are consistent. FAIL if the product is absent or materially different. "
+                "If the reference or generated view does not support a confident comparison, answer false. Evidence must describe visible product details, not prompt text.")})
+        user_content = [{"type": "text", "text": json.dumps(reqs, ensure_ascii=False)}]
+        user_content.append({"type": "text", "text": "IMAGE A — GENERATED FRAME TO QA. Check every requested atom against this image."})
+        user_content.append({"type": "image_url", "image_url": {"url": data_uri(image_path)}})
+        for i, ref in enumerate(refs, start=1):
+            user_content.append({"type": "text", "text": f"REFERENCE IMAGE {i} — ORIGINAL TARGET-PRODUCT REFERENCE. Use this image only to check product identity; do not copy its background or composition."})
+            user_content.append({"type": "image_url", "image_url": {"url": data_uri(ref)}})
         content, meta = _chat(params, api_key, send, [
             {"role": "system", "content": system},
-            {"role": "user", "content": [{"type": "text", "text": json.dumps(reqs)},
-                                         {"type": "image_url", "image_url": {"url": data_uri(image_path)}}]}],
+            {"role": "user", "content": user_content}],
             {"type": "json_object"} if params.get("response_format_mode", "json_object") != "prompt" else None)
         data = extract_json(content)
         out = {}
         requested_ids = {a.id for a in atoms}
+        if refs:
+            requested_ids.add(identity_id)
         rows = data.get("results") if isinstance(data, dict) else None
         matching_rows = []
         duplicate_ids = []
@@ -139,53 +158,31 @@ def make_openrouter_judge(params: dict, api_key=None, transport=None):
                 rid, passed, evidence = r["id"], r.get("pass"), r.get("evidence")
                 if rid not in requested_ids:
                     continue
-                # A duplicated ID is ambiguous: omit every occurrence rather than keeping the last one.
                 if counts[rid] != 1 or type(passed) is not bool or not isinstance(evidence, str) or not evidence.strip():
-                    if type(passed) is not bool:
-                        rows_invalid_pass += 1
-                    if not isinstance(evidence, str) or not evidence.strip():
-                        rows_missing_evidence += 1
+                    if type(passed) is not bool: rows_invalid_pass += 1
+                    if not isinstance(evidence, str) or not evidence.strip(): rows_missing_evidence += 1
                     continue
                 out[rid] = {"pass": passed, "evidence": evidence.strip()[:120]}
-
-        # Incomplete results remain NOT_RUN, but now the call log explains why parsing failed.
         if len(out) != len(requested_ids):
-            if not str(content or "").strip():
-                reason = "empty_response"
-            elif data is None:
-                reason = "invalid_json"
-            elif not isinstance(data, dict):
-                reason = "json_root_not_object"
-            elif not isinstance(rows, list):
-                reason = "missing_results_list"
-            elif not rows:
-                reason = "empty_results_list"
-            elif not matching_rows:
-                reason = "no_requested_ids_in_results"
-            elif not out:
-                reason = "all_matching_rows_rejected"
-            else:
-                reason = "partial_results"
-            meta = {
-                **meta,
-                "diagnostic": {
-                    "component": "openrouter_judge",
-                    "reason": reason,
-                    "expected_ids": len(requested_ids),
-                    "valid_ids": len(out),
-                    "matching_rows": len(matching_rows),
-                    "duplicate_ids": duplicate_ids[:10],
-                    "rows_invalid_pass": rows_invalid_pass,
-                    "rows_missing_evidence": rows_missing_evidence,
-                    "missing_ids": sorted(requested_ids - set(out))[:10],
-                    "response_excerpt": _safe_response_excerpt(content),
-                    "finish_reason": meta.get("finish_reason"),
-                    "completion_tokens": meta.get("completion_tokens"),
-                    "reasoning_tokens": meta.get("reasoning_tokens"),
-                    "message_has_reasoning": meta.get("message_has_reasoning"),
-                    "message_has_refusal": meta.get("message_has_refusal"),
-                },
-            }
+            if not str(content or "").strip(): reason = "empty_response"
+            elif data is None: reason = "invalid_json"
+            elif not isinstance(data, dict): reason = "json_root_not_object"
+            elif not isinstance(rows, list): reason = "missing_results_list"
+            elif not rows: reason = "empty_results_list"
+            elif not matching_rows: reason = "no_requested_ids_in_results"
+            elif not out: reason = "all_matching_rows_rejected"
+            else: reason = "partial_results"
+            meta = {**meta, "diagnostic": {
+                "component": "openrouter_judge", "reason": reason,
+                "expected_ids": len(requested_ids), "valid_ids": len(out),
+                "matching_rows": len(matching_rows), "duplicate_ids": duplicate_ids[:10],
+                "rows_invalid_pass": rows_invalid_pass, "rows_missing_evidence": rows_missing_evidence,
+                "missing_ids": sorted(requested_ids - set(out))[:10],
+                "response_excerpt": _safe_response_excerpt(content),
+                "finish_reason": meta.get("finish_reason"), "completion_tokens": meta.get("completion_tokens"),
+                "reasoning_tokens": meta.get("reasoning_tokens"),
+                "message_has_reasoning": meta.get("message_has_reasoning"),
+                "message_has_refusal": meta.get("message_has_refusal")}}
         return out, meta
 
     return judge

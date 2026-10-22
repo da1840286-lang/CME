@@ -29,6 +29,22 @@ def _blocked(state, out, shot, attempt, status, detail):
             "commercial_status": "NOT_PRODUCED"})
 
 
+def _image_input_manifest(previous_refs, product_photos) -> list[dict]:
+    """Audit the exact ordered image-reference list handed to the provider without storing absolute paths."""
+    import hashlib
+    out = []
+    ordered = [("previous_generated_frame", p) for p in previous_refs]
+    ordered.extend(("target_product_photo", p) for p in product_photos)
+    for index, (role, raw_path) in enumerate(ordered, start=1):
+        path = Path(raw_path)
+        item = {"index": index, "role": role, "filename": path.name, "sha256": None, "available": path.is_file()}
+        if path.is_file():
+            try: item["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError: item["available"] = False
+        out.append(item)
+    return out
+
+
 def _commercial_status(provider_info: dict) -> str:
     """Anything produced by a free or never-confirmed adapter is a test artifact."""
     if provider_info and provider_info.get("tier") == "paid" and provider_info.get("verified"):
@@ -71,10 +87,12 @@ def produce_shot(*, offer, atoms, shot, contract_id, state, out_dir, image_provi
     assert_exact_payload(receipt, compiled.text)                   # nothing appended after binding
     image_path = out / "shots" / f"shot_{shot:02d}_a{attempt:02d}.png"
     image_path.parent.mkdir(parents=True, exist_ok=True)
+    provider_refs = list(refs) + list(offer.photos)  # existing order is preserved: previous frame, then target-product photos
     base = {"lost": compiled.lost_line(), "ad_requirements": list(ad_requirements),
-            "provider": {}, "commercial_status": "TEST_ONLY"}
+            "provider": {}, "commercial_status": "TEST_ONLY",
+            "image_inputs": _image_input_manifest(refs, offer.photos)}
     try:
-        image_path.write_bytes(image_provider(receipt.sent_prompt, list(refs) + list(offer.photos)))
+        image_path.write_bytes(image_provider(receipt.sent_prompt, provider_refs))
         base["provider"] = dict(getattr(image_provider, "info", {}) or {})
         base["commercial_status"] = _commercial_status(base["provider"])
         receipt = attach_qa(receipt, atoms, qa_checks(image_path))
