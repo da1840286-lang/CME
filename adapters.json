@@ -4,7 +4,7 @@
    "name": "openrouter_free_brain",
    "kind": "brain",
    "provider": "openrouter",
-   "model_id": "qwen/qwen3.8-27b:free",
+   "model_id": "nvidia/nemotron-3.5-super-vl:free",
    "tier": "free",
    "verified": false,
    "params": {
@@ -19,12 +19,12 @@
    "name": "openrouter_free_judge",
    "kind": "judge",
    "provider": "openrouter",
-   "model_id": "qwen/qwen3.8-27b:free",
+   "model_id": "nvidia/nemotron-3.5-super-vl:free",
    "tier": "free",
    "verified": false,
    "params": {
     "response_format_mode": "json_object",
-    "temperature": 0.0,
+    "temperature": 0,
     "max_tokens": 1500
    },
    "price_hint": "free; rate limited",
@@ -34,7 +34,7 @@
    "name": "openrouter_free_analyst",
    "kind": "analyst",
    "provider": "openrouter",
-   "model_id": "qwen/qwen3.8-27b:free",
+   "model_id": "nvidia/nemotron-3.5-super-vl:free",
    "tier": "free",
    "verified": false,
    "params": {
@@ -85,7 +85,7 @@
       "const": 4
      },
      {
-      "const": 1.0
+      "const": 1
      },
      {
       "const": false
