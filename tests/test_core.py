@@ -54,12 +54,18 @@ class AtomTests(unittest.TestCase):
 
     def test_claims_verified_verbatim_only(self):
         o = load_offer(EX)
-        ok = parse_atoms([self.good(kind="claim", text="Reusable and dishwasher safe")]).atoms
-        bad = parse_atoms([self.good(id="b_2", kind="claim", text="Lasts a lifetime")]).atoms
+        ok = parse_atoms([self.good(kind="claim", text="Reusable and dishwasher safe", channel="qa")]).atoms
+        bad = parse_atoms([self.good(id="b_2", kind="claim", text="Lasts a lifetime", channel="qa")]).atoms
         forb = parse_atoms([self.good(id="c_3", text="Guaranteed fresh food")]).atoms
         self.assertEqual(check_claims(ok, o), {})
         self.assertIn("UNVERIFIED_CLAIM", check_claims(bad, o)["b_2"][0])
         self.assertIn("FORBIDDEN_CLAIM", check_claims(forb, o)["c_3"][0])
+
+    def test_verified_claim_cannot_be_compiled_as_an_image_requirement(self):
+        o = load_offer(EX)
+        claim = parse_atoms([self.good(kind="claim", text="Reusable and dishwasher safe")]).atoms
+        errors = check_claims(claim, o)
+        self.assertIn("CLAIM_CHANNEL", errors["a_1"][0])
 
 
 class CompilerTests(unittest.TestCase):

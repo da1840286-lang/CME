@@ -20,7 +20,10 @@ class PatchError(Exception):
 def build_request(offer, brief: str, shots: int, failed=None) -> dict:
     req = {"schema": ATOM_SCHEMA, "offer": offer.to_dict(), "brief": brief, "shots": shots,
            "rules": ["Return atoms only, no finished prompts.",
-                     "Claim atoms must copy a verified claim verbatim.",
+                     "Every kind='claim' atom must copy one verified claim verbatim and use channel='qa'; it records offer truth, not pixels.",
+                     "Never put kind='claim' atoms in channel='image'. If visible proof is needed, create a separate image atom of kind product/action/scene that describes an observable cue, such as a close-up of the zip closure visibly shut.",
+                     "Do not treat abstract claims such as reusable or dishwasher-safe as visually verifiable from a generic still. Ask for a visible label only when the brief explicitly requires on-image text.",
+                     "Never invent text, pseudo-lettering, logos, brand names or labels. Reproduce them only when present in supplied product assets or explicitly specified by the offer/brief.",
                      "Never use a forbidden claim."]}
     if failed:
         req["only_fix"] = failed  # [{id, errors, previous_text}]

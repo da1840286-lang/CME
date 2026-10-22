@@ -93,7 +93,7 @@ class BrainTests(unittest.TestCase):
         good = {"id": "a_ok", "kind": "scene", "text": "A kitchen counter", "priority": "MUST",
                 "channel": "image", "shot": 1}
         bad = {"id": "a_bad", "kind": "claim", "text": "Lasts forever", "priority": "MUST",
-               "channel": "image", "shot": 1}
+               "channel": "qa", "shot": 1}
         fixed = dict(bad, text="Seals with a zip closure")
 
         def call(req):

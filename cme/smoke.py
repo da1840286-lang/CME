@@ -135,7 +135,8 @@ def run_frame(args, offer, settings, catalog, vertical, log, run_id, ctx, out, a
         print("перенос:", note)
     provider = make_image_provider(settings, catalog, log, run_id, **ctx)
     judge = make_judge(settings, catalog, log, run_id, **ctx) if settings.judge_adapter else None
-    qa = make_qa_checks(atoms, args.shot, judge_fn=judge, ocr_required=not args.no_ocr_required)
+    qa = make_qa_checks(atoms, args.shot, judge_fn=judge, ocr_required=not args.no_ocr_required,
+                        verified_claims=offer.verified_claims)
     refs = [state.shots[args.shot - 1]["image_path"]] if (args.shot - 1) in state.shots else []
     try:
         receipt, compiled, verdict = produce_shot(

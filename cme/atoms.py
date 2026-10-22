@@ -115,6 +115,8 @@ def check_claims(atoms, offer) -> dict:
     errors = {}
     for a in atoms:
         errs = []
+        if a.kind == "claim" and a.channel != "qa":
+            errs.append("CLAIM_CHANNEL: verified claims are offer facts; use channel 'qa' and a separate image atom for visible evidence")
         if a.kind == "claim" and norm(a.text) not in verified:
             errs.append("UNVERIFIED_CLAIM: claim atom must be a verified claim verbatim")
         low = norm(a.text)

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from PIL import Image, ImageChops, ImageStat
+from .atoms import norm
 
 
 @dataclass(frozen=True)
@@ -97,16 +98,26 @@ def judge_batch_checks(path, atoms, judge_fn, required=False):
 
 
 def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr_required=True,
-                   text_allowed=False, anchors=()):
-    """Build qa_checks(path) for one shot. anchors: (check_id, previous_frame_path, region, min_similarity)."""
-    pool = [a for a in atoms if a.shot == shot and a.channel in ("image", "qa")]
+                   text_allowed=False, anchors=(), verified_claims=()):
+    """Build QA for one shot. Offer claims are contract-checked, not inferred from pixels."""
+    claims = [a for a in atoms if a.shot == shot and a.channel == "qa" and a.kind == "claim"]
+    claim_set = {norm(c) for c in verified_claims}
+    # A claim atom is an offer-truth record. Visual proof, when needed, is a separate image atom.
+    pool = [a for a in atoms if a.shot == shot and a.channel in ("image", "qa")
+            and not (a.channel == "qa" and a.kind == "claim")]
 
     def run(path):
         res = [file_check("file", path, expected_size),
                ocr_text_check("no_text", path, text_allowed, ocr=ocr, required=ocr_required)]
         for cid, prev, region, minimum in anchors:
             res.append(anchor_similarity(cid, prev, path, region, minimum))
-        if judge_fn is not None:
+        for a in claims:
+            valid = norm(a.text) in claim_set
+            res.append(CheckResult(
+                a.id, "PASS" if valid else "FAIL", a.priority == "MUST", "code",
+                "matches verified offer claim; not inferred from pixels" if valid
+                else "claim is absent from offer.verified_claims"))
+        if judge_fn is not None and pool:
             res.extend(judge_batch_checks(path, pool, judge_fn))
         return res
 

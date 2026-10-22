@@ -56,8 +56,15 @@ class AtomRulesTests(unittest.TestCase):
     def test_claim_cannot_hide_under_a_free_form_kind(self):
         # the only way to state a product claim is kind='claim', which must be a verified claim verbatim
         offer = load_offer(EX)
-        hidden = parse_atoms([atom("sneaky", "Lasts a lifetime", kind="claim")]).atoms
+        hidden = parse_atoms([atom("sneaky", "Lasts a lifetime", kind="claim", channel="qa")]).atoms
         self.assertIn("UNVERIFIED_CLAIM", check_claims(hidden, offer)["sneaky"][0])
+
+    def test_verified_claim_cannot_be_an_image_atom(self):
+        offer = load_offer(EX)
+        claim = parse_atoms([atom("claim_a", "Reusable and dishwasher safe", kind="claim")]).atoms
+        self.assertIn("CLAIM_CHANNEL", check_claims(claim, offer)["claim_a"][0])
+        factual = parse_atoms([atom("claim_b", "Reusable and dishwasher safe", kind="claim", channel="qa")]).atoms
+        self.assertEqual(check_claims(factual, offer), {})
 
 
 class ProviderLoggingTests(unittest.TestCase):
@@ -188,6 +195,8 @@ class OpenRouterBrainTests(unittest.TestCase):
         system, user = payload["messages"][0]["content"], json.loads(payload["messages"][1]["content"])
         self.assertIn("max 120 chars", system)
         self.assertIn("claim", system)
+        self.assertIn("channel='qa'", system)
+        self.assertIn("Never invent text", system)
         self.assertNotIn("/", user["offer"]["photos"][0])  # no local paths reach the API
         self.assertEqual(meta["model"], "vendor/model:free")
         self.assertEqual(data["atoms"][0]["id"], "scene_a")
@@ -311,6 +320,36 @@ class QASuiteTests(unittest.TestCase):
         row = next(c for c in r.checks if c["check_id"] == "no_text")
         self.assertFalse(row["required"])
 
+    def test_verified_claim_is_checked_against_offer_not_image(self):
+        offer = load_offer(EX)
+        claim = A("claim_01", "Reusable and dishwasher safe", ch="qa", kind="claim")
+        atoms = self.atoms + [claim]
+        judged_ids = []
+
+        def judge(path, batch):
+            judged_ids.extend(a.id for a in batch)
+            return {a.id: {"pass": True, "evidence": "seen"} for a in batch}
+
+        qa = make_qa_checks(atoms, 1, judge_fn=judge, ocr=lambda p: "",
+                            verified_claims=offer.verified_claims)
+        with tempfile.TemporaryDirectory() as d:
+            receipt, _, verdict = produce_shot(
+                offer=offer, atoms=atoms, shot=1, contract_id="c", state=new_run("r"), out_dir=d,
+                image_provider=lambda p, r: PNG, qa_checks=qa)
+        check = next(c for c in receipt.checks if c["check_id"] == "claim_01")
+        row = next(r for r in receipt.rows if r["atom_id"] == "claim_01")
+        self.assertEqual(verdict, "PASS")
+        self.assertEqual((check["status"], check["source"]), ("PASS", "code"))
+        self.assertIn("not inferred from pixels", check["detail"])
+        self.assertNotIn("claim_01", judged_ids)
+        self.assertNotIn("Reusable and dishwasher safe", receipt.sent_prompt)
+        self.assertEqual(row["status"], "VERIFIED")
+
+    def test_ocr_detected_text_fails_a_no_text_contract(self):
+        result = make_qa_checks(self.atoms, 1, judge_fn=self.judge_ok, ocr=lambda p: "gonnols")(self.img)
+        row = next(c for c in result if c.check_id == "no_text")
+        self.assertEqual(row.status, "FAIL")
+
     def test_judge_fail_fails_the_shot(self):
         bad = lambda p, atoms: {a.id: {"pass": a.id != "prod", "evidence": "missing"} for a in atoms}
         _, _, v = self.verdict(make_qa_checks(self.atoms, 1, judge_fn=bad, ocr=lambda p: ""))
@@ -397,7 +436,7 @@ class SmokeEndToEndTests(unittest.TestCase):
 
     def make_ctx(self, quota=False, tmp=None, judge_fail=False):
         brain_atoms = {"atoms": [atom("scene_a", "A bright kitchen counter"), atom("prod_a", "Product in the foreground", kind="product"),
-                                 atom("claim_a", "Reusable and dishwasher safe", kind="claim", priority="SHOULD")]}
+                                 atom("claim_a", "Reusable and dishwasher safe", kind="claim", channel="qa", priority="SHOULD")]}
         def transport(method, url, headers, payload):
             content = payload["messages"][1]["content"]
             if isinstance(content, list):  # judge call (has an image)
