@@ -25,7 +25,8 @@
    "params": {
     "response_format_mode": "json_object",
     "temperature": 0,
-    "max_tokens": 1500
+    "max_tokens": 1500,
+    "reasoning": {"enabled": false}
    },
    "price_hint": "free; rate limited",
    "notes": "Vision judge. Evidence only: it can never grant PASS without code checks."
