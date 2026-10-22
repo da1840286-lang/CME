@@ -1,0 +1,54 @@
+"""Budget is code's job: drop MAY, then SHOULD; if MUST does not fit, stop with a list."""
+from __future__ import annotations
+from dataclasses import dataclass
+
+IMAGE_LIMIT = 3600
+MOTION_LIMIT = 1700
+
+
+class BudgetError(Exception):
+    def __init__(self, must_ids, chars, limit):
+        self.must_ids, self.chars, self.limit = must_ids, chars, limit
+        super().__init__(
+            f"MUST atoms need {chars} chars > limit {limit}. Split or merge these atoms "
+            f"(longest first): {', '.join(must_ids)}")
+
+
+@dataclass(frozen=True)
+class Compiled:
+    text: str
+    included: tuple
+    dropped: tuple  # (atom id, priority)
+    chars: int
+    limit: int
+
+    def lost_line(self) -> str:
+        if not self.dropped:
+            return "потеряно: нет"
+        return "потеряно: " + ", ".join(f"{i} ({p})" for i, p in self.dropped)
+
+
+def _fit(pool, limit, reserve, render):
+    keep, dropped = list(pool), []
+    for prio in ("MAY", "SHOULD"):
+        while len(render(keep)) + reserve > limit:
+            cands = [a for a in reversed(keep) if a.priority == prio]
+            if not cands:
+                break
+            keep.remove(cands[0])
+            dropped.append((cands[0].id, prio))
+    text = render(keep)
+    if len(text) + reserve > limit:
+        must = sorted((a for a in keep if a.priority == "MUST"), key=lambda a: -len(a.text))
+        raise BudgetError([a.id for a in must], len(text) + reserve, limit)
+    return Compiled(text, tuple(a.id for a in keep), tuple(dropped), len(text), limit)
+
+
+def compile_image_prompt(atoms, shot: int, limit: int = IMAGE_LIMIT, reserve: int = 0) -> Compiled:
+    pool = [a for a in atoms if a.shot == shot and a.channel == "image"]
+    return _fit(pool, limit, reserve, lambda sel: "\n".join(a.text for a in sel))
+
+
+def compile_motion_prompt(atoms, limit: int = MOTION_LIMIT, reserve: int = 0) -> Compiled:
+    pool = [a for a in atoms if a.channel == "motion"]
+    return _fit(pool, limit, reserve, lambda sel: "\n".join(f"Shot {a.shot}: {a.text}" for a in sel))

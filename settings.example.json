@@ -1,0 +1,10 @@
+{
+ "brain_adapter": "openrouter_free_brain",
+ "judge_adapter": "openrouter_free_judge",
+ "image_adapter": "hf_zerogpu_flux2_klein",
+ "fallback_adapter": "",
+ "allow_free": true,
+ "allow_unverified": true,
+ "max_attempts_per_shot": 2,
+ "analyst_adapter": "openrouter_free_analyst"
+}
