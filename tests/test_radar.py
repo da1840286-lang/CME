@@ -12,6 +12,14 @@ from cme.radar.store import Store
 from tests.radar_fixtures import FakeResp, synthetic_post, synthetic_response
 
 ROOT = Path(__file__).resolve().parent.parent
+
+def configured_analyst_model():
+    """Keep expectations aligned with the explicitly configured Creative Radar adapter."""
+    from cme.registry import load_catalog
+    settings = json.loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+    return load_catalog(ROOT / "adapters.json")[settings["analyst_adapter"]].model_id
+
+
 HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 
@@ -276,8 +284,9 @@ class ManualAnalysis(Env):
         self.assertEqual(res["status"], "OK")
         a = app.store.analyses(cid)[0]
         self.assertEqual(a["status"], "OK")
-        self.assertEqual(a["model_requested"], "google/gemma-4-26b-a4b-it:free")
-        self.assertEqual(a["model_responded"], "google/gemma-4-26b-a4b-it:free")
+        expected_model = configured_analyst_model()
+        self.assertEqual(a["model_requested"], expected_model)
+        self.assertEqual(a["model_responded"], expected_model)
         m = a["material"]
         self.assertEqual([f["t_sec"] for f in m["frames"]], [1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
         self.assertFalse(m["video_fully_viewed"])
