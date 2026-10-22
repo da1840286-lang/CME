@@ -84,9 +84,20 @@ def call_with_policy(primary: ModelRef, fn, log: CallLog, run_id: str, fallback:
                 log.write(run_id=run_id, requested_model=ref.model_id, responded_model=responded,
                           provider=ref.provider, tier=ref.tier, status="model_mismatch", fallback_used=is_fallback)
                 raise ModelMismatch(f"asked for {ref.model_id!r} but {responded!r} answered")
-            log.write(run_id=run_id, requested_model=primary.model_id, responded_model=responded or "unreported",
-                      provider=ref.provider, tier=ref.tier, cost=meta.get("cost"), status="ok",
-                      fallback_used=is_fallback)
+            record = {
+                "run_id": run_id,
+                "requested_model": primary.model_id,
+                "responded_model": responded or "unreported",
+                "provider": ref.provider,
+                "tier": ref.tier,
+                "cost": meta.get("cost"),
+                "status": "ok",
+                "fallback_used": is_fallback,
+            }
+            # Provider adapters may attach bounded, redacted diagnostics for a structurally invalid response.
+            if meta.get("diagnostic") is not None:
+                record["diagnostic"] = meta["diagnostic"]
+            log.write(**record)
             return result
         except InfraError as e:
             log.write(run_id=run_id, requested_model=ref.model_id, status="infra_error", error=str(e),
