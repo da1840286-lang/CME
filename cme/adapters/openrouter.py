@@ -17,6 +17,8 @@ def _chat(params, api_key, send, messages, response_format=None):
         raise ProviderCallError("OPENROUTER_API_KEY is not set")
     body = {"model": params["model_id"], "messages": messages,
             "temperature": params.get("temperature", 0.2), "max_tokens": params.get("max_tokens", 4000)}
+    if params.get("reasoning") is not None:
+        body["reasoning"] = params["reasoning"]
     if response_format:
         body["response_format"] = response_format
     status, raw = send("POST", URL, {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, body)
@@ -33,11 +35,23 @@ def _chat(params, api_key, send, messages, response_format=None):
             raise InfraError(f"openrouter error {code}: {msg}")
         raise ProviderCallError(f"openrouter error {code}: {msg}")
     try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as e:
+        choice = data["choices"][0]
+        message = choice["message"]
+        content = message.get("content")
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
         raise ProviderCallError(f"unexpected response shape: {raw[:200]!r}") from e
     usage = data.get("usage") or {}
-    return content or "", {"model": data.get("model"), "cost": usage.get("cost")}
+    details = usage.get("completion_tokens_details") or {}
+    meta = {
+        "model": data.get("model"),
+        "cost": usage.get("cost"),
+        "finish_reason": choice.get("finish_reason"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "reasoning_tokens": details.get("reasoning_tokens"),
+        "message_has_reasoning": bool(message.get("reasoning") or message.get("reasoning_details")),
+        "message_has_refusal": bool(message.get("refusal")),
+    }
+    return content or "", meta
 
 
 def extract_json(text: str):
@@ -165,6 +179,11 @@ def make_openrouter_judge(params: dict, api_key=None, transport=None):
                     "rows_missing_evidence": rows_missing_evidence,
                     "missing_ids": sorted(requested_ids - set(out))[:10],
                     "response_excerpt": _safe_response_excerpt(content),
+                    "finish_reason": meta.get("finish_reason"),
+                    "completion_tokens": meta.get("completion_tokens"),
+                    "reasoning_tokens": meta.get("reasoning_tokens"),
+                    "message_has_reasoning": meta.get("message_has_reasoning"),
+                    "message_has_refusal": meta.get("message_has_refusal"),
                 },
             }
         return out, meta
