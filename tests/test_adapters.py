@@ -1,6 +1,7 @@
 import base64, json, tempfile, unittest
 from pathlib import Path
 from cme.adapters.fal_http import make_fal_image
+from cme.adapters.http import check_status
 from cme.adapters.hf_space import extract_image_path, make_hf_space_image
 from cme.providers import (CallLog, InfraError, ModelRef, ProviderCallError, ProviderPolicyError,
                            call_with_policy, check_model)
@@ -13,6 +14,31 @@ from cme.offer import load_offer
 
 ROOT = Path(__file__).resolve().parent.parent
 PNG = png_bytes()
+
+
+class HTTPStatusDiagnosticTests(unittest.TestCase):
+    def test_rate_limit_error_detail_is_preserved_and_api_key_redacted(self):
+        secret = "sk-or-v1-" + "a" * 32
+        raw = json.dumps({
+            "error": {
+                "code": 429,
+                "message": f"Rate limit exceeded; token={secret}",
+                "metadata": {
+                    "provider_name": "ExampleProvider",
+                    "raw": {"message": "upstream capacity temporarily unavailable"},
+                },
+            }
+        }).encode("utf-8")
+        with self.assertRaises(InfraError) as raised:
+            check_status("openrouter", 429, raw)
+        message = str(raised.exception)
+        self.assertIn("openrouter HTTP 429", message)
+        self.assertIn("provider_code=429", message)
+        self.assertIn("provider_message=Rate limit exceeded", message)
+        self.assertIn("provider=ExampleProvider", message)
+        self.assertIn("provider_detail=upstream capacity temporarily unavailable", message)
+        self.assertNotIn(secret, message)
+        self.assertIn("[REDACTED]", message)
 
 
 class TierPolicyTests(unittest.TestCase):
