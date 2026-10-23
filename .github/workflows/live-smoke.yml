@@ -1,89 +1,52 @@
-name: CME Control Center — pre-Layer-3
-run-name: CME pre-Layer-3 — ${{ inputs.offer_name }}
+name: CME live smoke
+run-name: CME live smoke (${{ inputs.stage }})
 
 on:
   workflow_dispatch:
     inputs:
-      offer_name:
-        description: "Target product name"
-        type: string
-        required: true
-        default: "Fanttik V8 Mate Cordless Car Vacuum"
-      product_type:
-        description: "Product type used by Brain and QA"
-        type: string
-        required: true
-        default: "cordless handheld car vacuum"
-      target_photo_url:
-        description: "Direct HTTPS image URL for the target product (not a store page)"
-        type: string
-        required: true
-        default: "https://fanttik.com/cdn/shop/files/1_398f4029-90d1-435e-b46d-0bf5b5fbb777.jpg?v=1772094680&width=1600"
-      verified_claims:
-        description: "Comma-separated verified product claims only"
-        type: string
-        required: true
-        default: "Cordless car vacuum"
-      country:
-        description: "TikTok ad market"
+      stage:
+        description: Which controlled live test to run
         type: choice
-        options: ["US", "GB", "CA", "AU", "DE", "NL"]
+        options:
+          - brain
+          - frame
         required: true
-        default: "US"
-      period:
-        description: "TikTok Top Ads lookback period (days)"
-        type: choice
-        options: ["7", "30", "180"]
-        required: true
-        default: "30"
-      keywords:
-        description: "TikTok ad search terms, comma-separated"
+        default: brain
+      brain_run_id:
+        description: Required for frame; run ID of a previous successful Brain stage in this workflow
         type: string
-        required: true
-        default: "car vacuum"
-      find_requests:
-        description: "SocialCrawl API request cap"
-        type: number
-        required: true
-        default: 4
-      find_max_ads:
-        description: "Maximum candidate ads to inspect"
-        type: number
-        required: true
-        default: 3
-      shots:
-        description: "Number of sequential frames to generate (1–6)"
-        type: number
-        required: true
-        default: 1
+        required: false
+      previous_frame_run_id:
+        description: Optional prior frame run ID; use this to carry attempt limits and state into a retry
+        type: string
+        required: false
+      no_ocr_required:
+        description: Mark the OCR text check as optional (the result may remain UNVERIFIED)
+        type: boolean
+        required: false
+        default: false
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
-  group: cme-control-center-${{ github.ref }}
+  group: cme-live-smoke-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  pre_layer3:
+  smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
     env:
-      SOCIALCRAWL_API_KEY: ${{ secrets.SOCIALCRAWL_API_KEY }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      OFFER_NAME: ${{ inputs.offer_name }}
-      PRODUCT_TYPE: ${{ inputs.product_type }}
-      TARGET_PHOTO_URL: ${{ inputs.target_photo_url }}
-      VERIFIED_CLAIMS: ${{ inputs.verified_claims }}
-      FIND_COUNTRY: ${{ inputs.country }}
-      FIND_PERIOD: ${{ inputs.period }}
-      FIND_KEYWORDS: ${{ inputs.keywords }}
-      FIND_REQUESTS: ${{ inputs.find_requests }}
-      FIND_MAX_ADS: ${{ inputs.find_max_ads }}
-      SHOTS: ${{ inputs.shots }}
+      CME_STAGE: ${{ inputs.stage }}
+      BRAIN_RUN_ID: ${{ inputs.brain_run_id }}
+      PREVIOUS_FRAME_RUN_ID: ${{ inputs.previous_frame_run_id }}
+      NO_OCR_REQUIRED: ${{ inputs.no_ocr_required }}
     steps:
-      - name: Check out selected branch
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -93,38 +56,150 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: Install CME dependencies and source-analysis tools
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg tesseract-ocr
+      - name: Install project dependencies
+        run: python -m pip install -r requirements.txt
 
-      - name: Validate Python syntax and configuration files
+      - name: Install Tesseract OCR for frame QA
+        if: inputs.stage == 'frame' && inputs.no_ocr_required != true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr
+
+      - name: Create default test settings
+        run: cp settings.example.json settings.json
+
+      - name: Validate inputs and required secrets
+        shell: bash
         run: |
           set -euo pipefail
-          python -m compileall -q cme tests
+          mkdir -p out
+          if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+            echo "::error::Add OPENROUTER_API_KEY in repository Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          if [[ "$CME_STAGE" == "frame" ]]; then
+            if [[ -z "${HF_TOKEN:-}" ]]; then
+              echo "::error::Add HF_TOKEN in repository Actions secrets before running frame."
+              exit 1
+            fi
+            if [[ ! "$BRAIN_RUN_ID" =~ ^[0-9]+$ ]]; then
+              echo "::error::For frame, provide the numeric run ID from a previous Brain workflow run."
+              exit 1
+            fi
+            if [[ -n "$PREVIOUS_FRAME_RUN_ID" && ! "$PREVIOUS_FRAME_RUN_ID" =~ ^[0-9]+$ ]]; then
+              echo "::error::previous_frame_run_id must be a numeric workflow run ID when provided."
+              exit 1
+            fi
+          fi
+
+      - name: Download atoms from previous Brain run
+        if: inputs.stage == 'frame'
+        uses: actions/download-artifact@v4
+        with:
+          name: cme-brain-out
+          path: out
+          run-id: ${{ inputs.brain_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download prior frame state for a controlled retry
+        if: inputs.stage == 'frame' && inputs.previous_frame_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: cme-frame-out
+          path: prior-frame
+          run-id: ${{ inputs.previous_frame_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Restore prior frame state and preserve attempt limits
+        if: inputs.stage == 'frame' && inputs.previous_frame_run_id != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s prior-frame/state.json || { echo "::error::Prior frame artifact has no state.json"; exit 1; }
           python - <<'PY'
           import json
           from pathlib import Path
-          json.loads(Path("settings.example.json").read_text(encoding="utf-8"))
-          json.loads(Path("adapters.json").read_text(encoding="utf-8"))
-          print("Pre-Layer-3 workflow preflight PASS.")
+          brain = json.loads(Path("out/atoms_manifest.json").read_text(encoding="utf-8"))
+          prior = json.loads(Path("prior-frame/atoms_manifest.json").read_text(encoding="utf-8"))
+          keys = ("schema_version", "offer_id", "atoms_sha256", "offer_fingerprint", "photo_hashes", "contract_id", "requested_shots")
+          mismatches = [key for key in keys if brain.get(key) != prior.get(key)]
+          if mismatches:
+              raise SystemExit("Prior frame belongs to a different Brain contract: " + ", ".join(mismatches))
           PY
+          # The manifest equality above pins this state and its referenced images to the same Brain contract.
+          cp -a prior-frame/. out/
 
-      - name: Run FIND → ANALYZE → TRANSFER → FRAME QA
-        id: pipeline
-        run: python -m cme.github_pipeline
+      - name: Check Brain artifacts before frame generation
+        if: inputs.stage == 'frame'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s out/atoms.json || { echo "::error::Previous run has no non-empty out/atoms.json"; exit 1; }
+          test -s out/atoms_manifest.json || { echo "::error::Previous run has no out/atoms_manifest.json"; exit 1; }
+          echo "Brain artifacts are present. CME will validate the manifest against the checked-out offer/photos before generation."
 
-      - name: Upload full pre-Layer-3 evidence
+      - name: Run one controlled live smoke
+        id: smoke
+        shell: bash
+        run: |
+          set +e
+          if [[ "$CME_STAGE" == "brain" ]]; then
+            python -m cme.smoke brain --out out
+          else
+            attempt=1
+            if [[ -s out/state.json ]]; then
+              attempt="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          state = json.loads(Path("out/state.json").read_text(encoding="utf-8"))
+          used = sum(1 for item in state.get("attempts", []) if item.get("shot") == 1 and item.get("receipt_id"))
+          print(used + 1)
+          PY
+              )"
+            fi
+            args=(python -m cme.smoke frame --out out --attempt "$attempt")
+            if [[ "$NO_OCR_REQUIRED" == "true" ]]; then
+              args+=(--no-ocr-required)
+            fi
+            "${args[@]}"
+          fi
+          result=$?
+          echo "exit_code=$result" >> "$GITHUB_OUTPUT"
+          {
+            echo "## CME live smoke result"
+            echo "- Stage: $CME_STAGE"
+            echo "- Workflow run ID: ${GITHUB_RUN_ID}"
+            echo "- CME exit code: $result"
+            if [[ "$CME_STAGE" == "brain" && "$result" == "0" ]]; then
+              echo "- Next: inspect the uploaded cme-brain-out artifact and atoms.json; then run stage frame using this run ID."
+            elif [[ "$result" == "6" ]]; then
+              echo "- QA verdict: UNVERIFIED (artifacts are retained; inspect the receipt)."
+            elif [[ "$result" == "7" ]]; then
+              echo "- QA verdict: FAILED_QA or NOT_DELIVERED (artifacts are retained; inspect the receipt)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Defer the process exit status until after uploading artifacts.
+          exit 0
+
+      - name: Upload output, receipts, state, and call log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cme-control-center-output
-          path: |
-            out/
-            cme-live-work/radar/production/
-            cme-live-work/radar/calls.jsonl
+          name: cme-${{ inputs.stage }}-out
+          path: out/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 7
+
+      - name: Apply CME result as workflow status
+        if: always() && steps.smoke.outcome == 'success'
+        shell: bash
+        run: |
+          code="${{ steps.smoke.outputs.exit_code }}"
+          if [[ -z "$code" ]]; then
+            echo "::error::The smoke command did not record an exit code."
+            exit 1
+          fi
+          if [[ "$code" != "0" ]]; then
+            echo "::error::CME smoke exited with code $code. Output artifact was uploaded where available."
+            exit "$code"
+          fi
