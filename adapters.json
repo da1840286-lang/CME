@@ -10,7 +10,10 @@
    "params": {
     "response_format_mode": "json_schema",
     "temperature": 0.2,
-    "max_tokens": 4000
+    "max_tokens": 4000,
+    "reasoning": {
+     "enabled": false
+    }
    },
    "price_hint": "free; rate limited, availability changes",
    "notes": "Smoke test of the Brain path only, not commercial transfer quality. Requests strict JSON Schema output for the atoms contract."
