@@ -1,5 +1,5 @@
-name: CME Control Center
-run-name: CME production pipeline — ${{ inputs.offer_name }}
+name: CME Control Center — pre-Layer-3
+run-name: CME pre-Layer-3 — ${{ inputs.offer_name }}
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ on:
         required: true
         default: "https://fanttik.com/cdn/shop/files/1_398f4029-90d1-435e-b46d-0bf5b5fbb777.jpg?v=1772094680&width=1600"
       verified_claims:
-        description: "Comma-separated claims verified for the product; do not add unverified performance claims"
+        description: "Comma-separated verified product claims only"
         type: string
         required: true
         default: "Cordless car vacuum"
@@ -42,7 +42,7 @@ on:
         required: true
         default: "car vacuum"
       find_requests:
-        description: "SocialCrawl API request cap (controls FIND cost)"
+        description: "SocialCrawl API request cap"
         type: number
         required: true
         default: 4
@@ -52,16 +52,10 @@ on:
         required: true
         default: 3
       shots:
-        description: "Sequential image frames; start with 1 to limit generation cost"
+        description: "Number of sequential frames to generate (1–6)"
         type: number
         required: true
         default: 1
-      magic_hour_model:
-        description: "Magic Hour video model"
-        type: choice
-        options: ["ltx-2.5", "seedance-2.0-mini", "kling-3.0"]
-        required: true
-        default: "ltx-2.5"
 
 permissions:
   contents: read
@@ -71,14 +65,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  production:
+  pre_layer3:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     env:
       SOCIALCRAWL_API_KEY: ${{ secrets.SOCIALCRAWL_API_KEY }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      MAGIC_HOUR_API_KEY: ${{ secrets.MAGIC_HOUR_API_KEY }}
       OFFER_NAME: ${{ inputs.offer_name }}
       PRODUCT_TYPE: ${{ inputs.product_type }}
       TARGET_PHOTO_URL: ${{ inputs.target_photo_url }}
@@ -89,8 +82,6 @@ jobs:
       FIND_REQUESTS: ${{ inputs.find_requests }}
       FIND_MAX_ADS: ${{ inputs.find_max_ads }}
       SHOTS: ${{ inputs.shots }}
-      MAGIC_HOUR_MODEL: ${{ inputs.magic_hour_model }}
-      MAGIC_HOUR_RESOLUTION: "480p"
     steps:
       - name: Check out selected branch
         uses: actions/checkout@v4
@@ -102,35 +93,31 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: Install CME and media dependencies
+      - name: Install CME dependencies and source-analysis tools
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          python -m pip install magic_hour
-
-      - name: Install video tools for source analysis, assembly, and QA
-        run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg tesseract-ocr
 
-      - name: Validate workflow and Python syntax
+      - name: Validate Python syntax and configuration files
         run: |
           set -euo pipefail
-          python -m compileall -q cme
+          python -m compileall -q cme tests
           python - <<'PY'
           import json
           from pathlib import Path
           json.loads(Path("settings.example.json").read_text(encoding="utf-8"))
           json.loads(Path("adapters.json").read_text(encoding="utf-8"))
-          print("Workflow preflight PASS.")
+          print("Pre-Layer-3 workflow preflight PASS.")
           PY
 
-      - name: Run full CME pipeline
+      - name: Run FIND → ANALYZE → TRANSFER → FRAME QA
         id: pipeline
         run: python -m cme.github_pipeline
 
-      - name: Upload complete run report, receipts, approved frames, and final MP4
+      - name: Upload full pre-Layer-3 evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
