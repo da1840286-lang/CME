@@ -108,7 +108,7 @@ class VendoredCodeIsTheRealOne(Env):
             calls.append((url, params))
             item = synthetic_post(
                 str(9200 + len(calls)), brand="UNKNOWN",
-                title="Cordless car vacuum removes crumbs",
+                title="Shop now free shipping: cordless car vacuum removes crumbs",
                 ctr=None, cvr=None, views=3110000, duration=28,
             )
             item["post"]["author"]["username"] = "UNKNOWN"
@@ -118,7 +118,7 @@ class VendoredCodeIsTheRealOne(Env):
             ad["cvr"] = None
             ad["objective"] = ""
             ad["landing_page_url"] = ""
-            item["post"]["content"]["text"] = "Cordless car vacuum removes crumbs"
+            item["post"]["content"]["text"] = "Shop now free shipping: cordless car vacuum removes crumbs"
             return FakeResp(synthetic_response([item]))
         with mock.patch.object(T.requests, "get", fake_get):
             result = F.run_find(

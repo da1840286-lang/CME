@@ -179,7 +179,9 @@ class AutoSelectionTests(unittest.TestCase):
     def cand(self, cid, cls="DIRECT", video="https://v", excluded=None, score=None):
         return {"id": cid, "video_url": video,
                 "source_check": {"classification": cls, "excluded": excluded or []},
-                "source_score": {"final_score": score}}
+                "source_score": {"final_score": score, "action": "DEEP",
+                                 "tags": ["money_signal_pass"],
+                                 "components": {"money_signal_gate": {"pass": True, "hard_block": False}}}}
 
     def test_legacy_order_is_kept_and_unconfirmed_sources_are_skipped(self):
         items = [self.cand("a", "UNVERIFIED"), self.cand("b", "LOW"), self.cand("c", video=None),
