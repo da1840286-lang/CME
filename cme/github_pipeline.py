@@ -269,8 +269,9 @@ def main() -> int:
                 pass
         result["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _json(OUT / "live_result.json", result)
-        summary = Path(os.environ.get("GITHUB_STEP_SUMMARY", ""))
-        if str(summary) and summary.parent.exists():
+        summary_raw = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+        if summary_raw:
+            summary = Path(summary_raw)
             with summary.open("a", encoding="utf-8") as f:
                 f.write("# CME Control Center\n\n")
                 f.write(f"- **Status:** {result['status']}\n")
