@@ -143,7 +143,7 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       - name: Install FFmpeg for GitHub-only source-video analysis
-        if: inputs.stage == 'all' && inputs.candidate_id != ''
+        if: inputs.stage == 'all' && inputs.source_contract_json == ''
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
@@ -490,6 +490,9 @@ jobs:
               raise SystemExit("Selected candidate has no stable candidate ID.")
           if not candidate.get("video_url"):
               raise SystemExit("Selected ad has no video URL; no analyst/generator calls were made.")
+          selected_check = candidate.get("source_check") or {}
+          if selected_check.get("excluded") or str(selected_check.get("classification") or "").upper() == "HARD_EXCLUDE":
+              raise SystemExit("Selected source is hard-excluded by the legacy vertical classifier; no analyst/generator calls were made.")
           selection = {"candidate_id": cid, "selection_mode": selection_mode,
                        "brand": candidate.get("brand_name") or candidate.get("brand"),
                        "title": candidate.get("title"), "source_url": candidate.get("source_url"),
