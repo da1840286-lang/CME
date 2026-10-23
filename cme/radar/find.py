@@ -82,9 +82,11 @@ def to_candidate(item: dict, request: dict, collected_at: str, origin: str, sour
     score = None
     if decision is not None:
         score = {k: _d(decision, k) for k in ("final_score", "performance_score", "commercial_score", "funnel_fit_score",
-                                              "evidence_score", "longevity_score", "duration_fit_score", "action")}
+                                              "evidence_score", "longevity_score", "duration_fit_score", "action",
+                                              "mechanism_source_score", "source_value_type")}
         score["penalties"] = _d(decision, "penalties")
         score["tags"] = _d(decision, "tags")
+        score["components"] = _d(decision, "components") or {}
     why = {"explanation": _d(decision, "explanation"), "action": _d(decision, "action"), "tags": _d(decision, "tags"),
            "scope": rec.get("discovery_scope"), "boards": boards, "keywords": rec.get("discovery_keywords") or [],
            "hits": rec.get("discovery_hits"), "relevance_reason": rel.get("reason")}

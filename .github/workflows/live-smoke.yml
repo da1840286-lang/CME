@@ -472,6 +472,7 @@ jobs:
           from cme.radar.server import ROOT, RadarApp
 
           out = Path("out").resolve()
+          from cme.radar.select import block_reason, select_candidate
           requested_cid = os.environ.get("CANDIDATE_ID", "").strip()
           if requested_cid:
               candidates_file = Path("find-input/candidates.json")
@@ -516,8 +517,7 @@ jobs:
                           brand = str(c.get("brand") or "unknown brand")[:80]
                           url = c.get("source_url") if isinstance(c.get("source_url"), str) and str(c.get("source_url")).startswith("https://") else ""
                           summary.write(f"- `candidate_id: {c['id']}` — {brand}: {title}; score={c.get('final_score')}; video={'yes' if c.get('video_url_present') else 'no'}; [open ad]({url})\n")
-                      summary.write("\nThe highest-ranked candidate with a video URL, confirmed source relevance (DIRECT or EXPANDED) and no hard-exclusion flag will be passed to analysis.\n")
-              from cme.radar.select import select_candidate
+                      summary.write("\nThe highest-ranked candidate with video, DIRECT/EXPANDED relevance, and an explicit money-gate pass or mechanism-source score >= 70 will be passed to analysis. REJECT, hard blocks and zero scores are blocked.\n")
               candidates = json.loads(candidates_file.read_text(encoding="utf-8")).get("candidates", [])
               candidate, skipped = select_candidate(candidates)  # legacy ranking order; gate only decides who may proceed
               if candidate is None:
@@ -539,6 +539,9 @@ jobs:
           cid = str(candidate.get("id") or "").strip()
           if not cid:
               raise SystemExit("Selected candidate has no stable candidate ID.")
+          source_block = block_reason(candidate)
+          if source_block:
+              raise SystemExit(f"Selected candidate is blocked by the commercial/mechanism source gate ({source_block}); no analyst/generator calls were made.")
           if not candidate.get("video_url"):
               raise SystemExit("Selected ad has no video URL; no analyst/generator calls were made.")
           selected_check = candidate.get("source_check") or {}

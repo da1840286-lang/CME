@@ -1,8 +1,8 @@
 """Automatic source selection for unattended runs.
 
-Keeps the legacy ranking order (no new ranking rule). It only decides which ranked candidates are allowed to
-reach the paid analyst/generator calls: a video must exist, the legacy source check must not exclude the ad,
-and its relevance class must be confirmed. UNVERIFIED and LOW-relevance sources are skipped.
+Keeps the legacy ranking order. It gates the handoff to analyst/generator calls:
+video, confirmed target relevance, and an explicit commercial or mechanism-source pass.
+A high view count or DIRECT label alone is not a commercial pass.
 """
 from __future__ import annotations
 
@@ -13,21 +13,73 @@ def block_reason(candidate: dict, allowed_classes=AUTO_ALLOWED_CLASSES, min_fina
     """Empty string when the candidate may be analysed automatically, otherwise the reason it may not."""
     if not candidate.get("video_url"):
         return "no video URL"
+
     check = candidate.get("source_check") or {}
     classification = str(check.get("classification") or "").upper()
     if check.get("excluded") or classification == "HARD_EXCLUDE":
         return "hard-excluded by the legacy source check"
     if allowed_classes is not None and classification not in allowed_classes:
         return f"source relevance {classification or 'MISSING'} is not one of {', '.join(allowed_classes)}"
-    if min_final_score is not None:
-        score = (candidate.get("source_score") or {}).get("final_score")
-        if not isinstance(score, (int, float)) or score < min_final_score:
-            return f"final_score {score!r} is below the required {min_final_score}"
+
+    score = candidate.get("source_score") or {}
+    if not isinstance(score, dict):
+        score = {}
+    action = str(score.get("action") or "").upper()
+    tags_raw = score.get("tags") or []
+    if isinstance(tags_raw, str):
+        tags = {tags_raw}
+    elif isinstance(tags_raw, (list, tuple, set)):
+        tags = {str(tag) for tag in tags_raw}
+    else:
+        tags = set()
+
+    components = score.get("components") or {}
+    components = components if isinstance(components, dict) else {}
+    money_gate = components.get("money_signal_gate") or {}
+    money_gate = money_gate if isinstance(money_gate, dict) else {}
+    duration = components.get("duration") or {}
+    duration = duration if isinstance(duration, dict) else {}
+
+    source_value_type = str(score.get("source_value_type") or "").upper()
+    try:
+        mechanism_score = float(score.get("mechanism_source_score") or 0)
+    except (TypeError, ValueError):
+        mechanism_score = 0.0
+    mechanism_pass = (
+        source_value_type in {"MECHANISM_SOURCE", "BOTH"} and mechanism_score >= 70.0
+    ) or "long_source_allowed_for_mechanism" in tags
+
+    # A scorer's explicit rejection is terminal. Mechanism-source is a separate path only
+    # when the scorer itself did not reject the candidate.
+    if action == "REJECT":
+        return "legacy scorer action is REJECT"
+
+    money_hard_block = money_gate.get("hard_block") is True or "money_signal_hard_block" in tags
+    if money_hard_block and not mechanism_pass:
+        return "money-signal hard block; no mechanism-source exception"
+
+    duration_hard_block = duration.get("hard_block") is True or "duration_over_60_hard_block" in tags
+    if duration_hard_block and not mechanism_pass:
+        return "duration hard block; no mechanism-source exception"
+
+    money_pass = money_gate.get("pass") is True or "money_signal_pass" in tags
+    if not money_pass and not mechanism_pass:
+        return "no explicit money-gate pass or mechanism-source score >= 70"
+
+    final_score = score.get("final_score")
+    if isinstance(final_score, (int, float)) and not isinstance(final_score, bool):
+        if final_score <= 0 and not mechanism_pass:
+            return f"final_score {final_score!r} is zero or below"
+        if min_final_score is not None and final_score < min_final_score:
+            return f"final_score {final_score!r} is below the required {min_final_score}"
+    elif min_final_score is not None:
+        return f"final_score {final_score!r} is below the required {min_final_score}"
+
     return ""
 
 
 def select_candidate(candidates, allowed_classes=AUTO_ALLOWED_CLASSES, min_final_score=None):
-    """Return (candidate or None, [skip notes]) taking the first candidate in the given (legacy) order that passes."""
+    """Return (candidate or None, [skip notes]) in legacy ranking order."""
     skipped = []
     for item in candidates or []:
         reason = block_reason(item, allowed_classes, min_final_score)
