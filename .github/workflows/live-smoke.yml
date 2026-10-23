@@ -410,7 +410,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          if [[ "$CME_STAGE" == "find" || ( "$CME_STAGE" == "all" && -z "$CANDIDATE_ID" && -z "$SOURCE_CONTRACT_JSON_INPUT" ) ]]; then
+          if [[ "$CME_STAGE" == "find" ]]; then
             python - <<'PY'
           import json, os
           from pathlib import Path
@@ -471,7 +471,34 @@ jobs:
           else:
               candidates_file = out / "candidates.json"
               if not candidates_file.is_file():
-                  raise SystemExit("Automatic FIND did not produce candidates.json")
+                  # Full automatic run: FIND and its handoff stay in this same Actions job.
+                  from cme.radar.find import run_find
+                  keywords = [x.strip() for x in os.environ.get("FIND_KEYWORDS", "").split(",") if x.strip()]
+                  params = {"country": os.environ["FIND_COUNTRY"].upper(),
+                            "period": int(os.environ["FIND_PERIOD"]),
+                            "max_requests": int(os.environ["FIND_REQUESTS"]),
+                            "max_ads": int(os.environ["FIND_MAX_ADS"]),
+                            "keywords": keywords, "discovery_mode": "auto"}
+                  find_result = run_find(params)
+                  candidates_file.write_text(json.dumps(find_result, ensure_ascii=False, indent=2), encoding="utf-8")
+                  rows = []
+                  for c in find_result.get("candidates", []):
+                      score = c.get("source_score") or {}
+                      rows.append({"id": c.get("id"), "brand": c.get("brand_name") or c.get("brand"),
+                                   "title": c.get("title"), "source_url": c.get("source_url"),
+                                   "video_url_present": bool(c.get("video_url")),
+                                   "final_score": score.get("final_score") if isinstance(score, dict) else None,
+                                   "source_check": c.get("source_check")})
+                  (out / "candidate_summary.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                      summary.write("## TikTok FIND shortlist (automatic pipeline)\n\n")
+                      summary.write(f"Country: {params['country']} · Period: {params['period']} days · Request cap: {params['max_requests']} · Candidate cap: {params['max_ads']} · Keywords: {', '.join(keywords) or 'broad Top Ads'}\n\n")
+                      for c in rows:
+                          title = str(c.get("title") or "(no title)").replace("\n", " ")[:160]
+                          brand = str(c.get("brand") or "unknown brand")[:80]
+                          url = c.get("source_url") if isinstance(c.get("source_url"), str) and str(c.get("source_url")).startswith("https://") else ""
+                          summary.write(f"- `candidate_id: {c['id']}` — {brand}: {title}; score={c.get('final_score')}; video={'yes' if c.get('video_url_present') else 'no'}; [open ad]({url})\n")
+                      summary.write("\nThe highest-ranked candidate with a video URL and no hard-exclusion flag will be passed to analysis.\n")
               candidates = json.loads(candidates_file.read_text(encoding="utf-8")).get("candidates", [])
               eligible = []
               for item in candidates:  # preserves legacy engine ranking order
