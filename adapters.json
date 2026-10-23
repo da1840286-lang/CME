@@ -8,12 +8,12 @@
    "tier": "free",
    "verified": false,
    "params": {
-    "response_format_mode": "json_object",
+    "response_format_mode": "json_schema",
     "temperature": 0.2,
     "max_tokens": 4000
    },
    "price_hint": "free; rate limited, availability changes",
-   "notes": "Smoke test of the Brain path only. Not a measure of commercial transfer quality. Switch response_format_mode to json_schema or prompt if the model rejects json_object."
+   "notes": "Smoke test of the Brain path only, not commercial transfer quality. Requests strict JSON Schema output for the atoms contract."
   },
   {
    "name": "openrouter_free_judge",
