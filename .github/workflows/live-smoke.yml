@@ -5,23 +5,46 @@ on:
   workflow_dispatch:
     inputs:
       stage:
-        description: Which controlled live test to run
+        description: "Run only Brain, generate one frame from prior atoms, or run the complete transfer-to-QA pipeline"
         type: choice
         options:
           - brain
           - frame
+          - all
         required: true
         default: brain
+      offer_json:
+        description: "OfferCard JSON for brain/all; photos must be repository-relative paths to real images. Not needed for frame."
+        type: string
+        required: false
+        default: ""
+      source_contract_json:
+        description: "Source transfer JSON for brain/all: saved Radar analysis result or accepted old CME transfer contract. Omit for frame."
+        type: string
+        required: false
+        default: ""
+      shots:
+        description: "Number of sequential frames for brain/all (1-6; keep at 1 for first live run)"
+        type: number
+        required: true
+        default: 1
+      brief:
+        description: "Target-native production brief; source mechanism is carried separately from source_contract_json"
+        type: string
+        required: true
+        default: "Create target-native vertical 9:16 product-ad frames. Preserve the source's causal commercial mechanism, but replace its product, brand, creator, props, scene, wording and composition. Show the configured target product clearly and use only verified OfferCard facts."
       brain_run_id:
-        description: Required for frame; run ID of a previous successful Brain stage in this workflow
+        description: "Required for frame; numeric run ID of a successful Brain stage from this exact branch commit"
         type: string
         required: false
+        default: ""
       previous_frame_run_id:
-        description: Optional prior frame run ID; use this to carry attempt limits and state into a retry
+        description: "Optional prior frame run ID for a controlled retry; restores state and attempt limits"
         type: string
         required: false
+        default: ""
       no_ocr_required:
-        description: Mark the OCR text check as optional (the result may remain UNVERIFIED)
+        description: "Make OCR's no-text check optional; a missing required check can still leave QA UNVERIFIED"
         type: boolean
         required: false
         default: false
@@ -37,16 +60,22 @@ concurrency:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     env:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      CME_REPOSITORY: ${{ github.repository }}
       CME_STAGE: ${{ inputs.stage }}
+      OFFER_JSON_INPUT: ${{ inputs.offer_json }}
+      SOURCE_CONTRACT_JSON_INPUT: ${{ inputs.source_contract_json }}
+      SHOTS: ${{ inputs.shots }}
+      BRIEF_INPUT: ${{ inputs.brief }}
       BRAIN_RUN_ID: ${{ inputs.brain_run_id }}
       PREVIOUS_FRAME_RUN_ID: ${{ inputs.previous_frame_run_id }}
       NO_OCR_REQUIRED: ${{ inputs.no_ocr_required }}
     steps:
-      - name: Check out repository
+      - name: Check out selected branch and commit
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -59,38 +88,146 @@ jobs:
       - name: Install project dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Install Tesseract OCR for frame QA
-        if: inputs.stage == 'frame' && inputs.no_ocr_required != true
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends tesseract-ocr
-
-      - name: Create default test settings
-        run: cp settings.example.json settings.json
-
-      - name: Validate inputs and required secrets
-        shell: bash
+      - name: Create controlled runtime settings
         run: |
           set -euo pipefail
           mkdir -p out
-          if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
-            echo "::error::Add OPENROUTER_API_KEY in repository Settings > Secrets and variables > Actions."
-            exit 1
+          cp settings.example.json settings.json
+
+      - name: Validate offer, target photos, and transfer contract before provider calls
+        if: inputs.stage != 'frame'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from cme.brain import build_source_transfer_context
+          from cme.offer import load_offer
+          from cme.qa import validate_product_references
+
+          root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          out = (root / "out").resolve()
+          raw_offer = os.environ.get("OFFER_JSON_INPUT", "").strip()
+          raw_source = os.environ.get("SOURCE_CONTRACT_JSON_INPUT", "").strip()
+          if not raw_offer:
+              raise SystemExit("offer_json is required for brain/all. Paste a real target OfferCard JSON.")
+          if not raw_source:
+              raise SystemExit("source_contract_json is required for brain/all. Paste a saved Radar analysis result or accepted old CME transfer contract.")
+          try:
+              offer_data = json.loads(raw_offer)
+              source_data = json.loads(raw_source)
+          except json.JSONDecodeError as exc:
+              raise SystemExit(f"Input is not valid JSON (line {exc.lineno}, column {exc.colno}): {exc.msg}") from exc
+          if not isinstance(offer_data, dict):
+              raise SystemExit("offer_json must be a JSON object")
+          if not isinstance(source_data, dict):
+              raise SystemExit("source_contract_json must be a JSON object")
+          photos = offer_data.get("photos")
+          if not isinstance(photos, list) or not photos:
+              raise SystemExit("OfferCard.photos must be a non-empty array of repository-relative image paths")
+          normalized = []
+          for raw in photos:
+              if not isinstance(raw, str) or not raw.strip():
+                  raise SystemExit("Every OfferCard.photos entry must be a non-empty repository-relative path")
+              item = Path(raw)
+              if item.is_absolute():
+                  raise SystemExit("OfferCard.photos must use repository-relative paths, not absolute paths")
+              photo = (root / item).resolve()
+              if not photo.is_relative_to(root):
+                  raise SystemExit(f"Photo path escapes the repository: {raw}")
+              if not photo.is_file():
+                  raise SystemExit(f"Photo is not present in this branch checkout: {raw}. Commit the real product photo first.")
+              normalized.append(os.path.relpath(photo, out))
+          offer_data["photos"] = normalized
+          offer_path = out / "live_offer.json"
+          offer_path.write_text(json.dumps(offer_data, ensure_ascii=False, indent=2), encoding="utf-8")
+          offer = load_offer(offer_path)
+          issues = validate_product_references(offer.photos)
+          if issues:
+              raise SystemExit("Target-product photo preflight blocked before provider calls: " + "; ".join(issues))
+          if source_data.get("candidate_id") and str(source_data.get("status", "")).upper() != "OK":
+              raise SystemExit("Saved Radar analysis wrapper must have status=OK before transfer")
+          context = build_source_transfer_context(source_data)
+          meaningful = ("mechanism_hypothesis", "transferability_hypothesis", "mechanism", "mechanism_representation",
+                        "transfer", "rebuild_plan", "image_creative_contract", "hook", "buyer_problem", "product_intervention")
+          if not any(context.get(key) for key in meaningful):
+              raise SystemExit("Source contract contains no usable mechanism/transfer evidence")
+          (out / "source_contract.json").write_text(json.dumps(source_data, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(f"Preflight PASS: offer={offer.offer_id}; target photo(s)={len(offer.photos)}; source-transfer context accepted.")
+          print("No provider calls were made by this preflight step.")
+          PY
+
+      - name: Validate live credentials, parameters, and artifact provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$CME_STAGE" in
+            brain)
+              [[ -n "${OPENROUTER_API_KEY:-}" ]] || { echo "::error::Add OPENROUTER_API_KEY in repository Settings > Secrets and variables > Actions."; exit 1; }
+              ;;
+            frame)
+              [[ -n "${OPENROUTER_API_KEY:-}" ]] || { echo "::error::Add OPENROUTER_API_KEY (Brain Judge) in Actions secrets."; exit 1; }
+              [[ -n "${HF_TOKEN:-}" ]] || { echo "::error::Add HF_TOKEN (Hugging Face image provider) in Actions secrets."; exit 1; }
+              [[ "$BRAIN_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::For frame, enter the numeric run ID from a successful brain run."; exit 1; }
+              if [[ -n "$PREVIOUS_FRAME_RUN_ID" && ! "$PREVIOUS_FRAME_RUN_ID" =~ ^[0-9]+$ ]]; then
+                echo "::error::previous_frame_run_id must be numeric."; exit 1
+              fi
+              ;;
+            all)
+              [[ -n "${OPENROUTER_API_KEY:-}" ]] || { echo "::error::Add OPENROUTER_API_KEY in Actions secrets."; exit 1; }
+              [[ -n "${HF_TOKEN:-}" ]] || { echo "::error::Add HF_TOKEN in Actions secrets."; exit 1; }
+              ;;
+            *) echo "::error::Unknown stage: $CME_STAGE"; exit 1 ;;
+          esac
+          if [[ "$CME_STAGE" != "frame" && ! "$SHOTS" =~ ^[1-6]$ ]]; then
+            echo "::error::shots must be an integer from 1 to 6."; exit 1
           fi
           if [[ "$CME_STAGE" == "frame" ]]; then
-            if [[ -z "${HF_TOKEN:-}" ]]; then
-              echo "::error::Add HF_TOKEN in repository Actions secrets before running frame."
-              exit 1
-            fi
-            if [[ ! "$BRAIN_RUN_ID" =~ ^[0-9]+$ ]]; then
-              echo "::error::For frame, provide the numeric run ID from a previous Brain workflow run."
-              exit 1
-            fi
-            if [[ -n "$PREVIOUS_FRAME_RUN_ID" && ! "$PREVIOUS_FRAME_RUN_ID" =~ ^[0-9]+$ ]]; then
-              echo "::error::previous_frame_run_id must be a numeric workflow run ID when provided."
-              exit 1
-            fi
+            python - <<'PY'
+          import json, os, urllib.error, urllib.request
+
+          repo = os.environ["CME_REPOSITORY"]
+          branch = os.environ["GITHUB_REF_NAME"]
+          sha = os.environ["GITHUB_SHA"]
+          token = os.environ["GH_TOKEN"]
+
+          def api(url):
+              req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as exc:
+                  raise SystemExit(f"GitHub API rejected run/artifact lookup ({exc.code}); check the run ID and Actions permissions") from exc
+
+          def check_run(run_id, artifact_name, require_success):
+              run = api(f"https://api.github.com/repos/{repo}/actions/runs/{run_id}")
+              if run.get("path") != ".github/workflows/live-smoke.yml":
+                  raise SystemExit(f"Run {run_id} was not created by CME live-smoke workflow")
+              if run.get("head_branch") != branch or run.get("head_sha") != sha:
+                  raise SystemExit(f"Run {run_id} belongs to a different branch/commit. Re-run Brain on {branch} at {sha[:12]} first.")
+              if run.get("status") != "completed":
+                  raise SystemExit(f"Run {run_id} has not completed")
+              if require_success and run.get("conclusion") != "success":
+                  raise SystemExit(f"Brain run {run_id} did not succeed (conclusion={run.get('conclusion')})")
+              artifacts = api(f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts").get("artifacts", [])
+              if not any(a.get("name") == artifact_name and not a.get("expired") for a in artifacts):
+                  raise SystemExit(f"Run {run_id} has no unexpired {artifact_name} artifact")
+
+          check_run(os.environ["BRAIN_RUN_ID"], "cme-brain-out", True)
+          prior = os.environ.get("PREVIOUS_FRAME_RUN_ID", "").strip()
+          if prior:
+              check_run(prior, "cme-frame-out", False)
+          print("Run provenance PASS: artifacts are from this workflow, branch, and exact commit.")
+          PY
           fi
+
+      - name: Install Tesseract OCR for frame QA
+        if: (inputs.stage == 'frame' || inputs.stage == 'all') && inputs.no_ocr_required != true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr
 
       - name: Download atoms from previous Brain run
         if: inputs.stage == 'frame'
@@ -126,25 +263,42 @@ jobs:
           if mismatches:
               raise SystemExit("Prior frame belongs to a different Brain contract: " + ", ".join(mismatches))
           PY
-          # The manifest equality above pins this state and its referenced images to the same Brain contract.
           cp -a prior-frame/. out/
 
-      - name: Check Brain artifacts before frame generation
+      - name: Validate offer and atom manifest before image generation
         if: inputs.stage == 'frame'
         shell: bash
         run: |
           set -euo pipefail
-          test -s out/atoms.json || { echo "::error::Previous run has no non-empty out/atoms.json"; exit 1; }
-          test -s out/atoms_manifest.json || { echo "::error::Previous run has no out/atoms_manifest.json"; exit 1; }
-          echo "Brain artifacts are present. CME will validate the manifest against the checked-out offer/photos before generation."
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from cme.offer import load_offer
+          from cme.qa import validate_product_references
+          from cme.smoke import validate_atoms_manifest
+          offer_path = Path("out/live_offer.json")
+          atoms_path = Path("out/atoms.json")
+          manifest_path = Path("out/atoms_manifest.json")
+          if not offer_path.is_file() or not atoms_path.is_file() or not manifest_path.is_file():
+              raise SystemExit("Brain artifact must include live_offer.json, atoms.json, and atoms_manifest.json")
+          offer = load_offer(offer_path)
+          issues = validate_product_references(offer.photos)
+          if issues:
+              raise SystemExit("Target-product photo preflight blocked generation: " + "; ".join(issues))
+          data = json.loads(atoms_path.read_text(encoding="utf-8"))
+          manifest = validate_atoms_manifest(atoms_path, manifest_path, data, offer, shot=1)
+          print(f"Frame preflight PASS: offer={offer.offer_id}; contract={manifest['contract_id']}; target photos verified.")
+          PY
 
-      - name: Run one controlled live smoke
+      - name: Run controlled live pipeline
         id: smoke
         shell: bash
         run: |
           set +e
           if [[ "$CME_STAGE" == "brain" ]]; then
-            python -m cme.smoke brain --out out
+            args=(python -m cme.smoke brain --offer out/live_offer.json --source-contract out/source_contract.json --shots "$SHOTS" --brief "$BRIEF_INPUT" --out out)
+          elif [[ "$CME_STAGE" == "all" ]]; then
+            args=(python -m cme.smoke all --offer out/live_offer.json --source-contract out/source_contract.json --shots "$SHOTS" --brief "$BRIEF_INPUT" --out out)
           else
             attempt=1
             if [[ -s out/state.json ]]; then
@@ -157,29 +311,36 @@ jobs:
           PY
               )"
             fi
-            args=(python -m cme.smoke frame --out out --attempt "$attempt")
-            if [[ "$NO_OCR_REQUIRED" == "true" ]]; then
-              args+=(--no-ocr-required)
-            fi
-            "${args[@]}"
+            args=(python -m cme.smoke frame --offer out/live_offer.json --out out --attempt "$attempt")
           fi
+          if [[ "$CME_STAGE" != "brain" && "$NO_OCR_REQUIRED" == "true" ]]; then
+            args+=(--no-ocr-required)
+          fi
+          "${args[@]}"
           result=$?
           echo "exit_code=$result" >> "$GITHUB_OUTPUT"
           {
-            echo "## CME live smoke result"
+            echo "## CME live pipeline result"
             echo "- Stage: $CME_STAGE"
             echo "- Workflow run ID: ${GITHUB_RUN_ID}"
+            echo "- Commit: ${GITHUB_SHA}"
             echo "- CME exit code: $result"
             if [[ "$CME_STAGE" == "brain" && "$result" == "0" ]]; then
-              echo "- Next: inspect the uploaded cme-brain-out artifact and atoms.json; then run stage frame using this run ID."
+              echo "- Next: inspect cme-brain-out/atoms.json, then run stage=frame with this run ID or stage=all for a single-call full pipeline."
             elif [[ "$result" == "6" ]]; then
-              echo "- QA verdict: UNVERIFIED (artifacts are retained; inspect the receipt)."
+              echo "- QA verdict: UNVERIFIED; artifacts retained for inspection."
             elif [[ "$result" == "7" ]]; then
-              echo "- QA verdict: FAILED_QA or NOT_DELIVERED (artifacts are retained; inspect the receipt)."
+              echo "- QA verdict: FAILED_QA or NOT_DELIVERED; artifacts retained for inspection."
+            elif [[ "$CME_STAGE" == "all" && "$result" == "0" ]]; then
+              echo "- Pipeline completed with zero exit code. Inspect receipts and every generated image before any commercial use."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-          # Defer the process exit status until after uploading artifacts.
+          # Defer process status until after output and receipts are uploaded.
           exit 0
+
+      - name: Remove raw source-transfer input from downloadable artifacts
+        if: always() && inputs.stage != 'frame'
+        run: rm -f out/source_contract.json
 
       - name: Upload output, receipts, state, and call log
         if: always()
@@ -200,6 +361,6 @@ jobs:
             exit 1
           fi
           if [[ "$code" != "0" ]]; then
-            echo "::error::CME smoke exited with code $code. Output artifact was uploaded where available."
+            echo "::error::CME live stage exited with code $code. Artifacts uploaded where available."
             exit "$code"
           fi
