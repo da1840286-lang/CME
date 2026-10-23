@@ -87,3 +87,82 @@ def select_candidate(candidates, allowed_classes=AUTO_ALLOWED_CLASSES, min_final
             return item, skipped
         skipped.append(f"{item.get('id')}: {reason}")
     return None, skipped
+
+
+
+def analysis_review_reason(
+    candidate: dict,
+    allowed_classes=AUTO_ALLOWED_CLASSES,
+    *,
+    min_final_score: float = 45.0,
+    min_performance_score: float = 55.0,
+    min_commercial_score: float = 40.0,
+) -> str:
+    """Gate for a *sampled-video analysis only*, never for image generation.
+
+    Existing production-approved candidates can also be analysed. The additional review
+    route is intentionally narrow: the sole blocker must be the scorer's missing money
+    gate; there must be a usable video, confirmed target relevance, no hard duration
+    block, and moderate independent pre-video scores. The analysis result is evidence to
+    inspect, not proof of conversion or profitability.
+    """
+    reason = block_reason(candidate, allowed_classes=allowed_classes)
+    if not reason:
+        return ""
+    if reason != "legacy scorer action is REJECT":
+        return reason
+
+    score = candidate.get("source_score") or {}
+    if not isinstance(score, dict):
+        return "source score is missing or invalid"
+    if str(score.get("action") or "").upper() != "REJECT":
+        return "rejected source is not an explicit scorer REJECT"
+
+    components = score.get("components") or {}
+    components = components if isinstance(components, dict) else {}
+    money_gate = components.get("money_signal_gate")
+    if not isinstance(money_gate, dict) or money_gate.get("pass") is not False:
+        return "review path requires an explicit failed money-signal gate"
+
+    duration = components.get("duration") or {}
+    duration = duration if isinstance(duration, dict) else {}
+    tags_raw = score.get("tags") or []
+    tags = {tags_raw} if isinstance(tags_raw, str) else {str(tag) for tag in tags_raw} if isinstance(tags_raw, (list, tuple, set)) else set()
+    if duration.get("hard_block") is True or "duration_over_60_hard_block" in tags:
+        return "duration hard block; source cannot enter review path"
+
+    source_value_type = str(score.get("source_value_type") or "").upper()
+    try:
+        mechanism_score = float(score.get("mechanism_source_score") or 0)
+    except (TypeError, ValueError):
+        mechanism_score = 0.0
+    mechanism_pass = source_value_type in {"MECHANISM_SOURCE", "BOTH"} and mechanism_score >= 70.0
+    if mechanism_pass:
+        return "scorer marked this mechanism source REJECT; manual inspection is required"
+
+    def numeric(name: str):
+        value = score.get(name)
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    final_score = numeric("final_score")
+    if final_score is None or final_score < min_final_score:
+        return f"final_score {final_score!r} is below analysis-review floor {min_final_score}"
+    performance_score = numeric("performance_score")
+    if performance_score is None or performance_score < min_performance_score:
+        return f"performance_score {performance_score!r} is below analysis-review floor {min_performance_score}"
+    commercial_score = numeric("commercial_score")
+    if commercial_score is None or commercial_score < min_commercial_score:
+        return f"commercial_score {commercial_score!r} is below analysis-review floor {min_commercial_score}"
+
+    return ""
+
+
+def select_analysis_candidate(candidates, allowed_classes=AUTO_ALLOWED_CLASSES):
+    """Choose the first source eligible for bounded video analysis, preserving ranked order."""
+    skipped = []
+    for item in candidates or []:
+        reason = analysis_review_reason(item, allowed_classes=allowed_classes)
+        if not reason:
+            return item, skipped
+        skipped.append(f"{item.get('id')}: {reason}")
+    return None, skipped

@@ -10,7 +10,7 @@ from cme.brain import (BrainError, build_request, build_source_transfer_context,
                        missing_mechanism_links, request_atoms)
 from cme.offer import load_offer
 from cme.qa import CheckResult, file_check, frame_content_check
-from cme.radar.select import block_reason, select_candidate
+from cme.radar.select import (analysis_review_reason, block_reason, select_analysis_candidate, select_candidate)
 from cme.receipt import attach_qa, build_receipt, overall
 from cme.smoke import contract_id_for, main as smoke_main, offer_fingerprint, validate_atoms_manifest
 from tests.helpers import png_bytes
@@ -200,6 +200,75 @@ class AutoSelectionTests(unittest.TestCase):
         self.assertEqual(block_reason(self.cand("a", score=0.8), min_final_score=0.5), "")
         self.assertIn("below", block_reason(self.cand("a", score=0.2), min_final_score=0.5))
         self.assertIn("below", block_reason(self.cand("a", score=None), min_final_score=0.5))
+
+
+
+class AnalysisOnlySourceGateTests(unittest.TestCase):
+    def candidate(self, cid, *, relevance="EXPANDED", final=51.7, performance=56.0,
+                  commercial=44.0, duration=35.934, money_pass=False, action="REJECT"):
+        tags = ["money_signal_hard_block"] if not money_pass else ["money_signal_pass"]
+        duration_block = duration is not None and duration > 60
+        if duration_block:
+            tags.append("duration_over_60_hard_block")
+        return {
+            "id": cid,
+            "video_url": "https://video.example/source.mp4",
+            "source_check": {"classification": relevance, "excluded": []},
+            "source_score": {
+                "final_score": final,
+                "performance_score": performance,
+                "commercial_score": commercial,
+                "action": action,
+                "source_value_type": "NONE",
+                "mechanism_source_score": 0,
+                "tags": tags,
+                "components": {
+                    "money_signal_gate": {"pass": money_pass, "hard_block": not money_pass},
+                    "duration": {"seconds": duration, "hard_block": duration_block},
+                    "mechanism_source": {"score": 0, "eligible": False},
+                },
+            },
+        }
+
+    def test_tess_like_candidate_can_reach_video_analysis_not_production(self):
+        candidate = self.candidate("tess", relevance="EXPANDED")
+        self.assertIn("REJECT", block_reason(candidate))
+        self.assertEqual(analysis_review_reason(candidate), "")
+        picked, skipped = select_analysis_candidate([candidate])
+        self.assertEqual(picked["id"], "tess")
+        self.assertEqual(skipped, [])
+        chosen, _ = select_candidate([candidate])
+        self.assertIsNone(chosen)
+
+    def test_toolhack_like_long_source_is_still_blocked(self):
+        for cid, duration, final, performance in (
+            ("toolhack-60s", 60.767, 0.0, 86.0),
+            ("toolhack-60s-b", 60.867, 0.0, 71.0),
+        ):
+            with self.subTest(candidate=cid):
+                candidate = self.candidate(cid, relevance="DIRECT", final=final,
+                                           performance=performance, commercial=40.0, duration=duration)
+                self.assertIn("duration hard block", analysis_review_reason(candidate))
+                picked, _ = select_analysis_candidate([candidate])
+                self.assertIsNone(picked)
+
+    def test_low_performance_and_hard_exclusion_do_not_enter_analysis(self):
+        low = self.candidate("low", relevance="DIRECT", final=18.7, performance=6.0, commercial=40.0)
+        excluded = self.candidate("excluded", relevance="HARD_EXCLUDE")
+        no_video = self.candidate("no-video")
+        no_video["video_url"] = None
+        for candidate in (low, excluded, no_video):
+            with self.subTest(candidate=candidate["id"]):
+                self.assertNotEqual(analysis_review_reason(candidate), "")
+        picked, _ = select_analysis_candidate([low, excluded, no_video])
+        self.assertIsNone(picked)
+
+    def test_explicit_money_pass_keeps_existing_production_path(self):
+        candidate = self.candidate("money-pass", relevance="DIRECT", final=70, performance=70,
+                                   commercial=60, money_pass=True, action="DEEP")
+        self.assertEqual(analysis_review_reason(candidate), "")
+        chosen, _ = select_candidate([candidate])
+        self.assertEqual(chosen["id"], "money-pass")
 
 
 if __name__ == "__main__":

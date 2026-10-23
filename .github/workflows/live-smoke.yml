@@ -5,10 +5,11 @@ on:
   workflow_dispatch:
     inputs:
       stage:
-        description: "Run FIND only, controlled Brain/frame smoke, or a complete pre-Layer-3 pipeline. In all, blank candidate/source contract triggers automatic FIND and ranked candidate selection."
+        description: "Run FIND, sampled-video source analysis only, controlled Brain/frame smoke, or a complete pre-Layer-3 pipeline. Analyze never generates images."
         type: choice
         options:
           - find
+          - analyze
           - brain
           - frame
           - all
@@ -44,12 +45,12 @@ on:
         required: false
         default: "car vacuum"
       find_run_id:
-        description: "For all: numeric run ID of a completed FIND run"
+        description: "For analyze/all: numeric run ID of a completed FIND run"
         type: string
         required: false
         default: ""
       candidate_id:
-        description: "For all: exact candidate_id from FIND summary; use GitHub-only selection without local Radar"
+        description: "For analyze/all: exact candidate_id from FIND summary; analyze samples video only, all may generate images"
         type: string
         required: false
         default: ""
@@ -64,7 +65,7 @@ on:
         required: false
         default: ""
       source_contract_json:
-        description: "Alternative for brain/all: saved Radar analysis result or accepted old CME transfer contract. Leave blank when using candidate_id."
+        description: "Alternative for brain/all: saved Radar analysis result or accepted old CME transfer contract. Stage analyze produces a review-only artifact; leave blank when using candidate_id."
         type: string
         required: false
         default: ""
@@ -143,7 +144,7 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       - name: Install FFmpeg for GitHub-only source-video analysis
-        if: inputs.stage == 'all' && inputs.source_contract_json == ''
+        if: (inputs.stage == 'all' && inputs.source_contract_json == '') || inputs.stage == 'analyze'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
@@ -236,6 +237,8 @@ jobs:
           if issues:
               raise SystemExit("Target-photo preflight blocked before provider calls: " + "; ".join(issues))
           if source_data is not None:
+              if stage == "all" and source_data.get("review_status") == "ANALYSIS_ONLY_NOT_COMMERCIALLY_APPROVED":
+                  raise SystemExit("Analysis-only source contract is not commercial approval and cannot be used by stage=all; rerun the strict source gate with the original FIND run.")
               if source_data.get("candidate_id") and str(source_data.get("status", "")).upper() != "OK":
                   raise SystemExit("Saved Radar analysis wrapper must have status=OK before transfer")
               context = build_source_transfer_context(source_data)
@@ -259,6 +262,11 @@ jobs:
               [[ "$FIND_PERIOD" =~ ^(7|30|180)$ ]] || { echo "::error::period must be 7, 30, or 180."; exit 1; }
               [[ "$FIND_REQUESTS" =~ ^([1-9]|10)$ ]] || { echo "::error::find_requests must be 1..10."; exit 1; }
               [[ "$FIND_MAX_ADS" =~ ^([1-9]|[1-4][0-9]|50)$ ]] || { echo "::error::find_max_ads must be 1..50."; exit 1; }
+              ;;
+            analyze)
+              [[ -n "${OPENROUTER_API_KEY:-}" ]] || { echo "::error::Add OPENROUTER_API_KEY in Actions secrets."; exit 1; }
+              [[ "$FIND_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::analyze requires find_run_id from a completed FIND run."; exit 1; }
+              [[ -n "$CANDIDATE_ID" ]] || { echo "::error::analyze requires the exact candidate_id from FIND."; exit 1; }
               ;;
             brain)
               [[ -n "${OPENROUTER_API_KEY:-}" ]] || { echo "::error::Add OPENROUTER_API_KEY in Actions secrets."; exit 1; }
@@ -287,7 +295,7 @@ jobs:
               ;;
             *) echo "::error::Unknown stage: $CME_STAGE"; exit 1 ;;
           esac
-          if [[ "$CME_STAGE" == "frame" || ( "$CME_STAGE" == "all" && -n "$CANDIDATE_ID" ) ]]; then
+          if [[ "$CME_STAGE" == "frame" || "$CME_STAGE" == "analyze" || ( "$CME_STAGE" == "all" && -n "$CANDIDATE_ID" ) ]]; then
             python - <<'PY'
           import json, os, urllib.error, urllib.request
           repo = os.environ["CME_REPOSITORY"]
@@ -304,12 +312,14 @@ jobs:
               except urllib.error.HTTPError as exc:
                   raise SystemExit(f"GitHub API rejected run/artifact lookup ({exc.code}); check run ID and Actions permissions") from exc
 
-          def check_run(run_id, artifact_name, require_success):
+          def check_run(run_id, artifact_name, require_success, allow_prior_commit=False):
               run = api(f"https://api.github.com/repos/{repo}/actions/runs/{run_id}")
               if run.get("path") != ".github/workflows/live-smoke.yml":
                   raise SystemExit(f"Run {run_id} was not created by CME live-smoke workflow")
-              if run.get("head_branch") != branch or run.get("head_sha") != sha:
-                  raise SystemExit(f"Run {run_id} belongs to another branch/commit. Repeat FIND/Brain on {branch} at {sha[:12]}.")
+              if run.get("head_branch") != branch:
+                  raise SystemExit(f"Run {run_id} belongs to another branch. Use a FIND artifact from {branch}.")
+              if run.get("head_sha") != sha and not allow_prior_commit:
+                  raise SystemExit(f"Run {run_id} belongs to another commit. Repeat FIND/Brain on {branch} at {sha[:12]}.")
               if run.get("status") != "completed":
                   raise SystemExit(f"Run {run_id} has not completed")
               if require_success and run.get("conclusion") != "success":
@@ -323,14 +333,18 @@ jobs:
               prior = os.environ.get("PREVIOUS_FRAME_RUN_ID", "").strip()
               if prior:
                   check_run(prior, "cme-frame-out", False)
+          elif os.environ["CME_STAGE"] == "analyze":
+              # FIND is data input, not a compiled contract: permit an earlier commit on
+              # the same branch so the current run can analyse an already-paid-for search.
+              check_run(os.environ["FIND_RUN_ID"], "cme-find-out", True, allow_prior_commit=True)
           else:
               check_run(os.environ["FIND_RUN_ID"], "cme-find-out", True)
-          print("Run provenance PASS: artifact belongs to this workflow, branch, and exact commit.")
+          print("Run provenance PASS: artifact belongs to this workflow and branch; commit pinning applied where required.")
           PY
           fi
 
       - name: Download selected TikTok candidates from FIND run
-        if: inputs.stage == 'all' && inputs.candidate_id != ''
+        if: (inputs.stage == 'all' || inputs.stage == 'analyze') && inputs.candidate_id != ''
         uses: actions/download-artifact@v4
         with:
           name: cme-find-out
@@ -464,6 +478,70 @@ jobs:
               else:
                   s.write("\nAutomatic selection: the following step chooses the highest-ranked candidate with a video URL, DIRECT/EXPANDED source relevance and no hard-exclusion flag.\n")
           print(f"FIND finished: {len(rows)} candidate(s).")
+          PY
+          elif [[ "$CME_STAGE" == "analyze" ]]; then
+            python - <<'PY'
+          import json, os, shutil
+          from pathlib import Path
+          from cme.radar.server import ROOT, RadarApp
+          from cme.radar.select import analysis_review_reason
+
+          out = Path("out").resolve()
+          run_id = os.environ.get("FIND_RUN_ID", "").strip()
+          cid = os.environ.get("CANDIDATE_ID", "").strip()
+          candidates_file = Path("find-input/candidates.json")
+          if not candidates_file.is_file():
+              raise SystemExit("FIND artifact lacks candidates.json")
+          candidates = json.loads(candidates_file.read_text(encoding="utf-8")).get("candidates", [])
+          candidate = next((c for c in candidates if c.get("id") == cid), None)
+          if candidate is None:
+              raise SystemExit(f"candidate_id {cid!r} is not in FIND run {run_id}")
+          reason = analysis_review_reason(candidate)
+          if reason:
+              raise SystemExit(f"Candidate is not eligible for analysis-only review ({reason}); no Analyst call was made.")
+
+          score = candidate.get("source_score") or {}
+          gate = ((score.get("components") or {}).get("money_signal_gate") or {})
+          out_selected = {"candidate_id": cid, "stage": "analyze", "decision": "ANALYSIS_ONLY",
+                          "commercial_gate_passed": bool(gate.get("pass")),
+                          "brand": candidate.get("brand_name") or candidate.get("brand"),
+                          "title": candidate.get("title"), "source_url": candidate.get("source_url"),
+                          "source_check": candidate.get("source_check"), "source_score": score}
+          (out / "selected_candidate.json").write_text(json.dumps(out_selected, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          work = Path("radar-work").resolve()
+          if work.exists():
+              shutil.rmtree(work)
+          app = RadarApp(work, settings_path=ROOT / "settings.json", catalog_path=ROOT / "adapters.json",
+                         offer_path=out / "unused-analysis-offer.json", vertical_path=ROOT / "verticals" / "physical_goods_us.json",
+                         production_shots=1)
+          try:
+              app.store.ingest([candidate], "github-find-" + run_id, "found")
+              status = app.do_analyze(cid)
+              saved_rows = app.store.analyses(cid)
+              saved = saved_rows[0] if saved_rows else {}
+              analysis = {"candidate_id": cid, "analysis_id": status.get("analysis_id"), "status": status.get("status"),
+                          "selection_mode": "manual_from_prior_find", "decision": "ANALYSIS_ONLY",
+                          "commercial_gate_passed": bool(gate.get("pass")),
+                          "source_evidence_scope": "six sampled video frames only; mechanism and transferability remain hypotheses",
+                          "result": saved.get("result"), "warnings": status.get("warnings", []), "detail": status.get("detail", "")}
+              (out / "source_analysis.json").write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+              if status.get("status") != "OK":
+                  raise SystemExit(5 if status.get("status") in {"API_ERROR", "INVALID_OUTPUT"} else 4)
+              source_contract = {"status": "OK", "candidate_id": cid, "analysis_id": status.get("analysis_id"),
+                                 "result": saved.get("result"), "commercial_gate_passed": bool(gate.get("pass")),
+                                 "review_status": "ANALYSIS_ONLY_NOT_COMMERCIALLY_APPROVED",
+                                 "source_scope": "sampled frames only; mechanism and transferability remain hypotheses"}
+              (out / "source_contract.json").write_text(json.dumps(source_contract, ensure_ascii=False, indent=2), encoding="utf-8")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write("## Source-only video analysis\n\n")
+                  summary.write(f"- Candidate: `{cid}`\n- Brand/title: {out_selected['brand'] or 'unknown'} — {out_selected['title'] or '(no title)'}\n")
+                  summary.write(f"- Analysis status: `{status.get('status')}`\n- Production/commercial approval: **not granted by this stage**\n")
+                  summary.write("- Outputs: `source_analysis.json` and a review-only `source_contract.json`; no image generation was called.\n")
+              print(json.dumps(analysis, ensure_ascii=False, indent=2))
+          finally:
+              app.store.close()
+              shutil.rmtree(work, ignore_errors=True)
           PY
           elif [[ "$CME_STAGE" == "all" && ( -n "$CANDIDATE_ID" || -z "$SOURCE_CONTRACT_JSON_INPUT" ) ]]; then
             python - <<'PY'
@@ -639,7 +717,7 @@ jobs:
             echo "- Commit: ${GITHUB_SHA}"
             echo "- CME exit code: $result"
             if [[ "$CME_STAGE" == "find" && "$result" == "0" ]]; then
-              echo "- Next: select candidate_id from this summary, then run stage=all with this run ID in find_run_id."
+              echo "- Next: select candidate_id from this summary, then run stage=analyze with this run ID in find_run_id to inspect the source without generating images."
             elif [[ "$CME_STAGE" == "brain" && "$result" == "0" ]]; then
               echo "- Next: inspect atoms.json, then run stage=frame with this run ID."
             elif [[ "$result" == "6" ]]; then
@@ -653,7 +731,7 @@ jobs:
           exit 0
 
       - name: Remove raw source-transfer input from downloadable artifacts
-        if: always() && inputs.stage != 'frame'
+        if: always() && inputs.stage != 'frame' && inputs.stage != 'analyze'
         run: rm -f out/source_contract.json
 
       - name: Upload output, receipts, state, and call log
