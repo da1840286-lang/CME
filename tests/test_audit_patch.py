@@ -302,6 +302,20 @@ class PatternTransferWorkflowWiringTests(unittest.TestCase):
         self.assertNotIn("Analysis-only source contract is not commercial approval and cannot be used by stage=all", workflow)
         self.assertIn("Relevance and commercial scores are retained as ranking/evidence metadata", workflow)
 
+    def test_all_can_reuse_prior_find_artifact_from_same_branch(self):
+        workflow = (ROOT / ".github" / "workflows" / "live-smoke.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            """else:
+              # FIND candidate lists are source data, not compiled contracts. Reuse a
+              # successful FIND artifact from an earlier commit on this same branch.
+              check_run(os.environ["FIND_RUN_ID"], "cme-find-out", True, allow_prior_commit=True)""",
+            workflow,
+        )
+        # The previous SHA may differ, but branch, success, and unexpired artifact checks remain.
+        self.assertIn('if run.get("head_branch") != branch:', workflow)
+        self.assertIn('if require_success and run.get("conclusion") != "success":', workflow)
+        self.assertIn('if not any(a.get("name") == artifact_name and not a.get("expired") for a in artifacts):', workflow)
+
     def test_find_diagnostics_no_longer_describe_money_gate_as_transfer_prerequisite(self):
         find_source = (ROOT / "cme" / "radar" / "find.py").read_text(encoding="utf-8")
         self.assertNotIn("automatic use still requires the DIRECT/EXPANDED source gate", find_source)

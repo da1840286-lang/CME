@@ -338,8 +338,10 @@ jobs:
               # the same branch so the current run can analyse an already-paid-for search.
               check_run(os.environ["FIND_RUN_ID"], "cme-find-out", True, allow_prior_commit=True)
           else:
-              check_run(os.environ["FIND_RUN_ID"], "cme-find-out", True)
-          print("Run provenance PASS: artifact belongs to this workflow and branch; commit pinning applied where required.")
+              # FIND candidate lists are source data, not compiled contracts. Reuse a
+              # successful FIND artifact from an earlier commit on this same branch.
+              check_run(os.environ["FIND_RUN_ID"], "cme-find-out", True, allow_prior_commit=True)
+          print("Run provenance PASS: artifact belongs to this workflow and branch; successful artifact checks remain required.")
           PY
           fi
 
