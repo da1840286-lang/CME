@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       stage:
-        description: "Run FIND, sampled-video source analysis only, controlled Brain/frame smoke, or a complete pre-Layer-3 pipeline. Analyze never generates images."
+        description: "Run FIND, extract a pattern from a selected video, run Brain/frame smoke, or create a full test creative. Source commercial scores rank candidates but do not gate pattern transfer."
         type: choice
         options:
           - find
@@ -50,7 +50,7 @@ on:
         required: false
         default: ""
       candidate_id:
-        description: "For analyze/all: exact candidate_id from FIND summary; analyze samples video only, all may generate images"
+        description: "For analyze/all: exact candidate_id from FIND; video + no hard exclusion required. Commercial score is metadata, not a pattern-transfer gate."
         type: string
         required: false
         default: ""
@@ -237,8 +237,8 @@ jobs:
           if issues:
               raise SystemExit("Target-photo preflight blocked before provider calls: " + "; ".join(issues))
           if source_data is not None:
-              if stage == "all" and source_data.get("review_status") == "ANALYSIS_ONLY_NOT_COMMERCIALLY_APPROVED":
-                  raise SystemExit("Analysis-only source contract is not commercial approval and cannot be used by stage=all; rerun the strict source gate with the original FIND run.")
+              # Pattern extraction is not commercial approval, but that is not a blocker
+              # for making a test creative. Validate the extracted mechanism below instead.
               if source_data.get("candidate_id") and str(source_data.get("status", "")).upper() != "OK":
                   raise SystemExit("Saved Radar analysis wrapper must have status=OK before transfer")
               context = build_source_transfer_context(source_data)
@@ -476,7 +476,7 @@ jobs:
               if mode == "find":
                   s.write("\nManual choice: run stage=all with this run ID and the selected candidate_id.\n")
               else:
-                  s.write("\nAutomatic selection: the following step chooses the highest-ranked candidate with a video URL, DIRECT/EXPANDED source relevance and no hard-exclusion flag.\n")
+                  s.write("\nAutomatic selection: the following step chooses the first candidate in FIND order with a video URL and no hard-exclusion flag. Relevance and commercial scores are retained as ranking/evidence metadata, not hard gates for pattern transfer.\n")
           print(f"FIND finished: {len(rows)} candidate(s).")
           PY
           elif [[ "$CME_STAGE" == "analyze" ]]; then
@@ -484,7 +484,7 @@ jobs:
           import json, os, shutil
           from pathlib import Path
           from cme.radar.server import ROOT, RadarApp
-          from cme.radar.select import analysis_review_reason
+          from cme.radar.select import pattern_source_reason
 
           out = Path("out").resolve()
           run_id = os.environ.get("FIND_RUN_ID", "").strip()
@@ -496,13 +496,18 @@ jobs:
           candidate = next((c for c in candidates if c.get("id") == cid), None)
           if candidate is None:
               raise SystemExit(f"candidate_id {cid!r} is not in FIND run {run_id}")
-          reason = analysis_review_reason(candidate)
+          reason = pattern_source_reason(candidate)
           if reason:
-              raise SystemExit(f"Candidate is not eligible for analysis-only review ({reason}); no Analyst call was made.")
+              raise SystemExit(f"Candidate cannot be used for pattern extraction ({reason}); no Analyst call was made.")
 
           score = candidate.get("source_score") or {}
-          gate = ((score.get("components") or {}).get("money_signal_gate") or {})
-          out_selected = {"candidate_id": cid, "stage": "analyze", "decision": "ANALYSIS_ONLY",
+          score = score if isinstance(score, dict) else {}
+          components = score.get("components") or {}
+          components = components if isinstance(components, dict) else {}
+          gate = components.get("money_signal_gate") or {}
+          gate = gate if isinstance(gate, dict) else {}
+          out_selected = {"candidate_id": cid, "stage": "analyze", "decision": "PATTERN_EXTRACTION_ONLY",
+                          "source_use_policy": "PATTERN_EXTRACTION_NOT_COMMERCIAL_APPROVAL",
                           "commercial_gate_passed": bool(gate.get("pass")),
                           "brand": candidate.get("brand_name") or candidate.get("brand"),
                           "title": candidate.get("title"), "source_url": candidate.get("source_url"),
@@ -520,9 +525,13 @@ jobs:
               status = app.do_analyze(cid)
               saved_rows = app.store.analyses(cid)
               saved = saved_rows[0] if saved_rows else {}
+              source_check = candidate.get("source_check") or {}
               analysis = {"candidate_id": cid, "analysis_id": status.get("analysis_id"), "status": status.get("status"),
-                          "selection_mode": "manual_from_prior_find", "decision": "ANALYSIS_ONLY",
+                          "selection_mode": "manual_from_prior_find", "decision": "PATTERN_EXTRACTION_ONLY",
+                          "source_use_policy": "PATTERN_EXTRACTION_NOT_COMMERCIAL_APPROVAL",
                           "commercial_gate_passed": bool(gate.get("pass")),
+                          "source_relevance": source_check.get("classification", "UNKNOWN"),
+                          "source_score": score.get("final_score"),
                           "source_evidence_scope": "six sampled video frames only; mechanism and transferability remain hypotheses",
                           "result": saved.get("result"), "warnings": status.get("warnings", []), "detail": status.get("detail", "")}
               (out / "source_analysis.json").write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -530,14 +539,15 @@ jobs:
                   raise SystemExit(5 if status.get("status") in {"API_ERROR", "INVALID_OUTPUT"} else 4)
               source_contract = {"status": "OK", "candidate_id": cid, "analysis_id": status.get("analysis_id"),
                                  "result": saved.get("result"), "commercial_gate_passed": bool(gate.get("pass")),
-                                 "review_status": "ANALYSIS_ONLY_NOT_COMMERCIALLY_APPROVED",
+                                 "source_use_policy": "PATTERN_EXTRACTION_NOT_COMMERCIAL_APPROVAL",
+                                 "review_status": "PATTERN_EXTRACTED_COMMERCIAL_PERFORMANCE_UNVERIFIED",
                                  "source_scope": "sampled frames only; mechanism and transferability remain hypotheses"}
               (out / "source_contract.json").write_text(json.dumps(source_contract, ensure_ascii=False, indent=2), encoding="utf-8")
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
                   summary.write("## Source-only video analysis\n\n")
                   summary.write(f"- Candidate: `{cid}`\n- Brand/title: {out_selected['brand'] or 'unknown'} — {out_selected['title'] or '(no title)'}\n")
                   summary.write(f"- Analysis status: `{status.get('status')}`\n- Production/commercial approval: **not granted by this stage**\n")
-                  summary.write("- Outputs: `source_analysis.json` and a review-only `source_contract.json`; no image generation was called.\n")
+                  summary.write("- Outputs: `source_analysis.json` and sanitized `source_contract.json`; no image generation was called.\n")
               print(json.dumps(analysis, ensure_ascii=False, indent=2))
           finally:
               app.store.close()
@@ -550,7 +560,7 @@ jobs:
           from cme.radar.server import ROOT, RadarApp
 
           out = Path("out").resolve()
-          from cme.radar.select import block_reason, select_candidate
+          from cme.radar.select import pattern_source_reason, select_transfer_candidate
           requested_cid = os.environ.get("CANDIDATE_ID", "").strip()
           if requested_cid:
               candidates_file = Path("find-input/candidates.json")
@@ -595,9 +605,9 @@ jobs:
                           brand = str(c.get("brand") or "unknown brand")[:80]
                           url = c.get("source_url") if isinstance(c.get("source_url"), str) and str(c.get("source_url")).startswith("https://") else ""
                           summary.write(f"- `candidate_id: {c['id']}` — {brand}: {title}; score={c.get('final_score')}; video={'yes' if c.get('video_url_present') else 'no'}; [open ad]({url})\n")
-                      summary.write("\nThe highest-ranked candidate with video, DIRECT/EXPANDED relevance, and an explicit money-gate pass or mechanism-source score >= 70 will be passed to analysis. REJECT, hard blocks and zero scores are blocked.\n")
+                      summary.write("\nThe first candidate in existing FIND order with a video and no hard exclusion is passed to pattern analysis. Commercial score, scorer REJECT, duration and relevance labels remain metadata; they do not gate creation of a test creative.\n")
               candidates = json.loads(candidates_file.read_text(encoding="utf-8")).get("candidates", [])
-              candidate, skipped = select_candidate(candidates)  # legacy ranking order; gate only decides who may proceed
+              candidate, skipped = select_transfer_candidate(candidates)  # preserve FIND order; commercial metrics do not gate pattern transfer
               if candidate is None:
                   stats = json.loads(candidates_file.read_text(encoding="utf-8")).get("stats") or {}
                   diag = json.loads(candidates_file.read_text(encoding="utf-8")).get("diagnostics") or {}
@@ -611,15 +621,15 @@ jobs:
                                f"hard_excluded={stats.get('pre_visual_verification_hard_excluded_ads', 0)}; "
                                f"sponsored_queries={tried}. ")
                   skip_text = "; ".join(skipped[:5]) or "FIND returned no ranked candidates to evaluate."
-                  raise SystemExit("FIND returned no ranked candidate that passes the automatic source gate (video + DIRECT/EXPANDED relevance + no hard exclusion): "
+                  raise SystemExit("FIND returned no usable pattern source (requires a video and no hard exclusion): "
                                    + skip_text + " " + diagnosis + "No analyst/generator calls were made.")
               selection_mode = "automatic_best_valid_ranked"
           cid = str(candidate.get("id") or "").strip()
           if not cid:
               raise SystemExit("Selected candidate has no stable candidate ID.")
-          source_block = block_reason(candidate)
+          source_block = pattern_source_reason(candidate)
           if source_block:
-              raise SystemExit(f"Selected candidate is blocked by the commercial/mechanism source gate ({source_block}); no analyst/generator calls were made.")
+              raise SystemExit(f"Selected candidate cannot be used for pattern transfer ({source_block}); no analyst/generator calls were made.")
           if not candidate.get("video_url"):
               raise SystemExit("Selected ad has no video URL; no analyst/generator calls were made.")
           selected_check = candidate.get("source_check") or {}
@@ -637,8 +647,9 @@ jobs:
               summary.write(f"- Mode: {selection_mode}\n")
               summary.write(f"- Candidate ID: `{cid}`\n")
               summary.write(f"- Brand/title: {selection.get('brand') or 'unknown'} — {selection.get('title') or '(no title)'}\n")
-              summary.write(f"- Legacy rank score: {(candidate.get('source_score') or {}).get('final_score')}\n")
-              summary.write("- Legacy ranking order is preserved; no new ranking rule was introduced.\n\n")
+              summary.write(f"- Source relevance: {(candidate.get('source_check') or {}).get('classification', 'UNKNOWN')}\n")
+              summary.write(f"- Source score (metadata): {(candidate.get('source_score') or {}).get('final_score')}\n")
+              summary.write("- FIND order is preserved. Commercial metrics inform prioritization but do not decide whether a pattern can be transferred.\n\n")
           work = Path("radar-work").resolve()
           if work.exists():
               shutil.rmtree(work)
@@ -649,13 +660,23 @@ jobs:
               find_reference = os.environ.get("FIND_RUN_ID", "").strip() or ("internal-" + os.environ.get("GITHUB_RUN_ID", "unknown"))
               app.store.ingest([candidate], "github-find-" + find_reference, "found")
               reason = ("Selected manually from GitHub Actions FIND" if selection_mode == "manual_from_prior_find"
-                        else "Automatically selected as the highest-ranked valid video candidate")
+                        else "Automatically selected as the first usable video candidate in FIND order")
               app.store.decide(cid, "shortlist", reason)
               status = app.do_analyze(cid)
               saved_rows = app.store.analyses(cid)
               saved = saved_rows[0] if saved_rows else {}
+              score = candidate.get("source_score") or {}
+              score = score if isinstance(score, dict) else {}
+              components = score.get("components") or {}
+              components = components if isinstance(components, dict) else {}
+              money_gate = components.get("money_signal_gate") or {}
+              money_gate = money_gate if isinstance(money_gate, dict) else {}
               analysis = {"candidate_id": cid, "analysis_id": status.get("analysis_id"), "status": status.get("status"),
                           "selection_mode": selection_mode,
+                          "source_use_policy": "PATTERN_EXTRACTION_NOT_COMMERCIAL_APPROVAL",
+                          "commercial_gate_passed": bool(money_gate.get("pass")),
+                          "source_relevance": (candidate.get("source_check") or {}).get("classification", "UNKNOWN"),
+                          "source_score": score.get("final_score"),
                           "source_evidence_scope": "six sampled video frames only; mechanism and transferability remain hypotheses",
                           "result": saved.get("result"), "warnings": status.get("warnings", []), "detail": status.get("detail", "")}
               (out / "source_analysis.json").write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")

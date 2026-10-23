@@ -10,7 +10,9 @@ from cme.brain import (BrainError, build_request, build_source_transfer_context,
                        missing_mechanism_links, request_atoms)
 from cme.offer import load_offer
 from cme.qa import CheckResult, file_check, frame_content_check
-from cme.radar.select import (analysis_review_reason, block_reason, select_analysis_candidate, select_candidate)
+from cme.radar.select import (analysis_review_reason, block_reason, pattern_source_reason,
+                              select_analysis_candidate, select_candidate, select_pattern_candidate,
+                              select_transfer_candidate)
 from cme.receipt import attach_qa, build_receipt, overall
 from cme.smoke import contract_id_for, main as smoke_main, offer_fingerprint, validate_atoms_manifest
 from tests.helpers import png_bytes
@@ -203,17 +205,19 @@ class AutoSelectionTests(unittest.TestCase):
 
 
 
-class AnalysisOnlySourceGateTests(unittest.TestCase):
+
+class PatternTransferSelectionTests(unittest.TestCase):
     def candidate(self, cid, *, relevance="EXPANDED", final=51.7, performance=56.0,
-                  commercial=44.0, duration=35.934, money_pass=False, action="REJECT"):
+                  commercial=44.0, duration=35.934, money_pass=False, action="REJECT",
+                  video="https://video.example/source.mp4", excluded=None):
         tags = ["money_signal_hard_block"] if not money_pass else ["money_signal_pass"]
         duration_block = duration is not None and duration > 60
         if duration_block:
             tags.append("duration_over_60_hard_block")
         return {
             "id": cid,
-            "video_url": "https://video.example/source.mp4",
-            "source_check": {"classification": relevance, "excluded": []},
+            "video_url": video,
+            "source_check": {"classification": relevance, "excluded": excluded or []},
             "source_score": {
                 "final_score": final,
                 "performance_score": performance,
@@ -230,46 +234,77 @@ class AnalysisOnlySourceGateTests(unittest.TestCase):
             },
         }
 
-    def test_tess_like_candidate_can_reach_video_analysis_not_production(self):
-        candidate = self.candidate("tess", relevance="EXPANDED")
+    def test_failed_money_gate_does_not_block_pattern_extraction(self):
+        candidate = self.candidate("tess", final=18.0, performance=6.0, commercial=5.0)
         self.assertIn("REJECT", block_reason(candidate))
-        self.assertEqual(analysis_review_reason(candidate), "")
-        picked, skipped = select_analysis_candidate([candidate])
+        self.assertEqual(pattern_source_reason(candidate), "")
+        picked, skipped = select_pattern_candidate([candidate])
         self.assertEqual(picked["id"], "tess")
         self.assertEqual(skipped, [])
         chosen, _ = select_candidate([candidate])
         self.assertIsNone(chosen)
 
-    def test_toolhack_like_long_source_is_still_blocked(self):
-        for cid, duration, final, performance in (
-            ("toolhack-60s", 60.767, 0.0, 86.0),
-            ("toolhack-60s-b", 60.867, 0.0, 71.0),
-        ):
-            with self.subTest(candidate=cid):
-                candidate = self.candidate(cid, relevance="DIRECT", final=final,
-                                           performance=performance, commercial=40.0, duration=duration)
-                self.assertIn("duration hard block", analysis_review_reason(candidate))
-                picked, _ = select_analysis_candidate([candidate])
-                self.assertIsNone(picked)
+    def test_long_low_score_source_can_transfer_its_pattern(self):
+        candidate = self.candidate("long", relevance="DIRECT", final=0.0,
+                                   performance=86.0, commercial=0.0, duration=83.5)
+        self.assertEqual(pattern_source_reason(candidate), "")
+        picked, _ = select_transfer_candidate([candidate])
+        self.assertEqual(picked["id"], "long")
+        self.assertIn("REJECT", block_reason(candidate))
 
-    def test_low_performance_and_hard_exclusion_do_not_enter_analysis(self):
-        low = self.candidate("low", relevance="DIRECT", final=18.7, performance=6.0, commercial=40.0)
-        excluded = self.candidate("excluded", relevance="HARD_EXCLUDE")
-        no_video = self.candidate("no-video")
-        no_video["video_url"] = None
-        for candidate in (low, excluded, no_video):
+    def test_low_or_unverified_relevance_is_metadata_not_a_hard_block(self):
+        low = self.candidate("low", relevance="LOW", final=0.0, performance=0.0, commercial=0.0)
+        unverified = self.candidate("unverified", relevance="UNVERIFIED", final=None,
+                                    performance=None, commercial=None, action="UNKNOWN")
+        for candidate in (low, unverified):
             with self.subTest(candidate=candidate["id"]):
-                self.assertNotEqual(analysis_review_reason(candidate), "")
-        picked, _ = select_analysis_candidate([low, excluded, no_video])
-        self.assertIsNone(picked)
+                self.assertEqual(pattern_source_reason(candidate), "")
+        picked, _ = select_transfer_candidate([low, unverified])
+        self.assertEqual(picked["id"], "low")
+        self.assertEqual(analysis_review_reason(unverified), "")
 
-    def test_explicit_money_pass_keeps_existing_production_path(self):
+    def test_missing_video_and_hard_exclusions_remain_blocked(self):
+        no_video = self.candidate("no-video", video=None)
+        excluded = self.candidate("excluded", relevance="HARD_EXCLUDE")
+        explicit_exclusion = self.candidate("excluded-list", relevance="DIRECT", excluded=["unsafe"])
+        for candidate in (no_video, excluded, explicit_exclusion):
+            with self.subTest(candidate=candidate["id"]):
+                self.assertNotEqual(pattern_source_reason(candidate), "")
+        picked, skipped = select_pattern_candidate([no_video, excluded, explicit_exclusion])
+        self.assertIsNone(picked)
+        self.assertEqual(len(skipped), 3)
+
+    def test_selector_skips_unusable_records_but_keeps_existing_order(self):
+        blocked = self.candidate("blocked", relevance="HARD_EXCLUDE")
+        missing = self.candidate("missing", video=None)
+        usable = self.candidate("usable", relevance="UNVERIFIED", final=0, performance=0, commercial=0)
+        picked, skipped = select_transfer_candidate([blocked, missing, usable])
+        self.assertEqual(picked["id"], "usable")
+        self.assertEqual(len(skipped), 2)
+
+    def test_explicit_money_pass_keeps_existing_strict_path(self):
         candidate = self.candidate("money-pass", relevance="DIRECT", final=70, performance=70,
                                    commercial=60, money_pass=True, action="DEEP")
-        self.assertEqual(analysis_review_reason(candidate), "")
+        self.assertEqual(pattern_source_reason(candidate), "")
         chosen, _ = select_candidate([candidate])
         self.assertEqual(chosen["id"], "money-pass")
 
 
+class PatternTransferWorkflowWiringTests(unittest.TestCase):
+    def test_manual_analysis_and_full_pipeline_use_pattern_policy(self):
+        workflow = (ROOT / ".github" / "workflows" / "live-smoke.yml").read_text(encoding="utf-8")
+        self.assertIn("from cme.radar.select import pattern_source_reason", workflow)
+        self.assertIn("from cme.radar.select import pattern_source_reason, select_transfer_candidate", workflow)
+        self.assertIn("candidate, skipped = select_transfer_candidate(candidates)", workflow)
+        self.assertNotIn("candidate, skipped = select_candidate(candidates)", workflow)
+        self.assertIn("PATTERN_EXTRACTION_NOT_COMMERCIAL_APPROVAL", workflow)
+        self.assertIn("Pattern extraction is not commercial approval", workflow)
+        self.assertNotIn("Analysis-only source contract is not commercial approval and cannot be used by stage=all", workflow)
+        self.assertIn("Relevance and commercial scores are retained as ranking/evidence metadata", workflow)
+
+    def test_find_diagnostics_no_longer_describe_money_gate_as_transfer_prerequisite(self):
+        find_source = (ROOT / "cme" / "radar" / "find.py").read_text(encoding="utf-8")
+        self.assertNotIn("automatic use still requires the DIRECT/EXPANDED source gate", find_source)
+        self.assertIn("commercial success is not required to extract a pattern", find_source)
 if __name__ == "__main__":
     unittest.main()

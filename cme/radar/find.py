@@ -156,16 +156,16 @@ def _find_diagnostics(stats: dict, candidate_count: int) -> dict:
     hard_excluded = int(stats.get("pre_visual_verification_hard_excluded_ads") or 0)
     if candidate_count:
         outcome = "CANDIDATES_FOUND"
-        explanation = "FIND produced a ranked candidate list; automatic use still requires the DIRECT/EXPANDED source gate."
+        explanation = "FIND produced a ranked candidate list. Video availability and hard exclusions determine pattern-source eligibility; relevance and commercial signals remain scoring evidence."
     elif raw_returned == 0:
         outcome = "NO_API_ROWS"
         explanation = "SocialCrawl returned no ad rows; check query coverage, credentials, provider response, and available credits."
     elif direct + expanded == 0:
         outcome = "NO_TARGET_RELEVANCE"
-        explanation = "SocialCrawl returned rows, but none met source-side DIRECT/EXPANDED target relevance; no model or generator call is justified."
+        explanation = "SocialCrawl returned rows, but none entered the target candidate list. Inspect query coverage, video availability and hard-exclusion diagnostics; commercial success is not required to extract a pattern."
     else:
         outcome = "NO_RANKED_CANDIDATE"
-        explanation = "Source-relevant rows were observed, but FIND returned no ranked candidate; inspect request and money-signal diagnostics."
+        explanation = "Source-relevant rows were observed, but FIND returned no ranked candidate; inspect request, video-availability and source-relevance diagnostics."
     return {
         "outcome": outcome,
         "explanation": explanation,
