@@ -12,4 +12,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
+      - name: Compile all CME modules
+        run: python -m compileall -q cme
       - run: python -m unittest discover -s tests -t . -v
