@@ -3,7 +3,7 @@
 `call` is injected (provider-specific code lives elsewhere): call(request: dict) -> dict.
 """
 from __future__ import annotations
-from .atoms import ATOM_SCHEMA, check_claims, parse_atoms
+from .atoms import ATOM_SCHEMA, check_claims, check_language, parse_atoms
 from .vertical import check_vertical
 
 
@@ -161,6 +161,70 @@ def build_source_transfer_context(contract: dict) -> dict:
     return result
 
 
+# ---- mechanism coverage -------------------------------------------------------------------------
+# The atom schema is unchanged. A mechanism link is carried by an ordinary MUST atom whose id starts with
+# `mech_<link>_`; code can then verify that every required link reached the contract, and the Judge checks
+# those atoms on the frame like any other MUST atom.
+MECHANISM_LINKS = ("problem", "intervention", "result")
+LINK_TEXT_LIMIT = 220
+
+
+def _link_text(value) -> str:
+    if isinstance(value, dict):
+        value = value.get("text") or value.get("value") or " ".join(str(v) for v in value.values() if isinstance(v, str))
+    elif isinstance(value, (list, tuple)):
+        value = "; ".join(str(v) for v in value if isinstance(v, (str, int, float)))
+    return " ".join(str(value or "").split())[:LINK_TEXT_LIMIT]
+
+
+def derive_mechanism_links(source_transfer) -> list:
+    """Pick the causal links the target frames must keep: problem -> intervention -> visible result.
+
+    Derived by code from the already-reduced source_transfer context, never by the Brain. Missing links are
+    simply not required (unknown stays unknown).
+    """
+    if not isinstance(source_transfer, dict):
+        return []
+    if source_transfer.get("format") == "radar_analysis_hypothesis":
+        sources = {"problem": source_transfer.get("buyer_problem"),
+                   "intervention": source_transfer.get("product_intervention"),
+                   "result": source_transfer.get("result_demo")}
+    else:
+        rep = source_transfer.get("mechanism_representation") or {}
+        mech = source_transfer.get("mechanism") or {}
+        sources = {"problem": rep.get("user_problem") or rep.get("trigger") or mech.get("problem"),
+                   "intervention": rep.get("intervention"),
+                   "result": rep.get("proof") or mech.get("proof")}
+    links = []
+    for name in MECHANISM_LINKS:
+        text = _link_text(sources.get(name))
+        if text:
+            links.append({"link": name, "atom_id_prefix": f"mech_{name}_", "source_statement": text})
+    return links
+
+
+def _atom_view(atom):
+    get = atom.get if isinstance(atom, dict) else (lambda k, d=None: getattr(atom, k, d))
+    return get("id") or "", get("priority"), get("channel"), get("kind")
+
+
+def missing_mechanism_links(atoms, links) -> list:
+    """Link names that no MUST atom (image or qa channel, not a claim) carries."""
+    missing = []
+    for link in links or []:
+        prefix = link["atom_id_prefix"] if isinstance(link, dict) else f"mech_{link}_"
+        name = link["link"] if isinstance(link, dict) else link
+        ok = False
+        for atom in atoms:
+            aid, prio, ch, kind = _atom_view(atom)
+            if str(aid).startswith(prefix) and prio == "MUST" and ch in ("image", "qa") and kind != "claim":
+                ok = True
+                break
+        if not ok:
+            missing.append(name)
+    return missing
+
+
 def build_request(offer, brief: str, shots: int, failed=None, source_transfer=None) -> dict:
     req = {"schema": ATOM_SCHEMA, "offer": offer.to_dict(), "brief": brief, "shots": shots,
            "rules": ["Return atoms only, no finished prompts.",
@@ -168,9 +232,18 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
                      "Never put kind='claim' atoms in channel='image'. If visible proof is needed, create a separate image atom of kind product/action/scene that describes an observable cue, such as a close-up of the zip closure visibly shut.",
                      "Do not treat abstract care or durability claims as visually verifiable from a generic still. Ask for a visible label only when the brief explicitly requires on-image text.",
                      "Never invent text, pseudo-lettering, logos, brand names or labels. Reproduce them only when present in supplied product assets or explicitly specified by the offer/brief.",
-                     "Never use a forbidden claim."]}
+                     "Never use a forbidden claim.",
+                     "Write every atom text in English, even when the input context is in another language. Translate the source statements; never copy non-English words into atoms."]}
     if source_transfer:
         req["source_transfer"] = source_transfer
+        links = derive_mechanism_links(source_transfer)
+        if links:
+            req["mechanism_links"] = links
+            req["rules"].append(
+                "mechanism_links lists the causal links that must survive the transfer. For EACH link create at least one "
+                "MUST atom with channel='image' (kind product/action/scene/composition, never claim) whose id starts with its "
+                "atom_id_prefix (for example mech_intervention_clamp) and whose text shows that link in the TARGET product's own "
+                "scene, with visible, checkable content. Do not copy the source product, brand, creator or setting.")
         req["rules"].extend([
             "When source_transfer is supplied, preserve its causal mechanism and target-native rebuild sequence as structured atom requirements.",
             "Use the current OfferCard as the sole authority for target-product facts and claims; an older contract's target_offer is context only and never overrides OfferCard.",
@@ -188,6 +261,7 @@ def request_atoms(offer, brief: str, shots: int, call, max_retries: int = 2, ver
     by_id: dict = {}
     pending: dict = {}
     failed = None
+    required_links = derive_mechanism_links(source_transfer)
     for _ in range(max_retries + 1):
         resp = call(build_request(offer, brief, shots, failed, source_transfer=source_transfer))
         raw = resp.get("atoms", [])
@@ -199,6 +273,8 @@ def request_atoms(offer, brief: str, shots: int, call, max_retries: int = 2, ver
         if resp.get("_error"):
             round_errs["#root"] = [str(resp["_error"])]
         for aid, errs in check_claims(parsed.atoms, offer).items():
+            round_errs.setdefault(aid, []).extend(errs)
+        for aid, errs in check_language(parsed.atoms).items():
             round_errs.setdefault(aid, []).extend(errs)
         if vertical is not None:
             for aid, errs in check_vertical(parsed.atoms, offer, vertical).items():
@@ -215,6 +291,8 @@ def request_atoms(offer, brief: str, shots: int, call, max_retries: int = 2, ver
         for k in range(1, shots + 1):
             if not any(a.shot == k and a.channel == "image" and a.priority == "MUST" for a in by_id.values()):
                 pending[f"#shot_{k}"] = [f"shot {k} has no MUST image atom"]
+        for name in missing_mechanism_links(by_id.values(), required_links):
+            pending[f"#mechanism_{name}"] = [f"mechanism link '{name}' has no MUST image atom with id prefix mech_{name}_"]
         if not pending:
             return list(by_id.values())
         prev_text = {i["id"]: i.get("text", "") for i in raw if isinstance(i, dict) and i.get("id")}

@@ -13,8 +13,8 @@ import json
 import sys
 import time
 from pathlib import Path
-from .atoms import check_claims, parse_atoms
-from .brain import BrainError, build_source_transfer_context, request_atoms
+from .atoms import check_claims, check_language, parse_atoms
+from .brain import BrainError, build_source_transfer_context, derive_mechanism_links, missing_mechanism_links, request_atoms
 from .compiler import BudgetError
 from .offer import OfferError, load_offer
 from .providers import CallLog, InfraError, ProviderCallError, ProviderPolicyError
@@ -79,6 +79,9 @@ def validate_atoms_manifest(atoms_path, manifest_path, atoms_json, offer, shot=N
     if type(requested) is int and any(type(a.get("shot")) is not int or a["shot"] > requested
                                       for a in atoms_json if isinstance(a, dict)):
         errors["#atoms"] = ["atoms contain a shot outside the Brain contract's requested range"]
+    lost_links = missing_mechanism_links(atoms_json, manifest.get("mechanism_links") or [])
+    if lost_links:
+        errors["#mechanism"] = [f"mechanism link '{n}' is no longer carried by a MUST atom" for n in lost_links]
     if errors:
         raise BrainError(errors)
     return manifest
@@ -114,6 +117,7 @@ def run_brain(args, offer, settings, catalog, vertical, log, run_id, ctx, out):
                 "atoms_sha256": _sha256_bytes(atoms_path.read_bytes()), "offer_fingerprint": fingerprint,
                 "photo_hashes": photo_hashes, "contract_id": contract_id_for(data, offer),
                 "requested_shots": args.shots,
+                "mechanism_links": [l["link"] for l in derive_mechanism_links(source_transfer)],
                 "brief_sha256": _sha256_bytes(args.brief.encode("utf-8")),
                 "source_contract_sha256": _sha256_bytes(Path(args.source_contract).read_bytes()) if args.source_contract else None,
                 "model_id": call.info.get("model_id"), "responded_model": call.info.get("responded_model")}
@@ -131,6 +135,8 @@ def run_frame(args, offer, settings, catalog, vertical, log, run_id, ctx, out, a
     claim_errors = check_claims(atoms, offer)
     vertical_errors = check_vertical(atoms, offer, vertical)
     merged_errors = {k: list(v) for k, v in claim_errors.items()}
+    for aid, reasons in check_language(atoms).items():
+        merged_errors.setdefault(aid, []).extend(reasons)
     for aid, reasons in vertical_errors.items():
         merged_errors.setdefault(aid, []).extend(reasons)
     if merged_errors:

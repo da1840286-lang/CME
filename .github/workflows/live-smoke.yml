@@ -448,7 +448,7 @@ jobs:
               if mode == "find":
                   s.write("\nManual choice: run stage=all with this run ID and the selected candidate_id.\n")
               else:
-                  s.write("\nAutomatic selection: the following step chooses the highest-ranked candidate with a video URL and no hard-exclusion flag.\n")
+                  s.write("\nAutomatic selection: the following step chooses the highest-ranked candidate with a video URL, DIRECT/EXPANDED source relevance and no hard-exclusion flag.\n")
           print(f"FIND finished: {len(rows)} candidate(s).")
           PY
           elif [[ "$CME_STAGE" == "all" && ( -n "$CANDIDATE_ID" || -z "$SOURCE_CONTRACT_JSON_INPUT" ) ]]; then
@@ -498,19 +498,13 @@ jobs:
                           brand = str(c.get("brand") or "unknown brand")[:80]
                           url = c.get("source_url") if isinstance(c.get("source_url"), str) and str(c.get("source_url")).startswith("https://") else ""
                           summary.write(f"- `candidate_id: {c['id']}` — {brand}: {title}; score={c.get('final_score')}; video={'yes' if c.get('video_url_present') else 'no'}; [open ad]({url})\n")
-                      summary.write("\nThe highest-ranked candidate with a video URL and no hard-exclusion flag will be passed to analysis.\n")
+                      summary.write("\nThe highest-ranked candidate with a video URL, confirmed source relevance (DIRECT or EXPANDED) and no hard-exclusion flag will be passed to analysis.\n")
+              from cme.radar.select import select_candidate
               candidates = json.loads(candidates_file.read_text(encoding="utf-8")).get("candidates", [])
-              eligible = []
-              for item in candidates:  # preserves legacy engine ranking order
-                  check = item.get("source_check") or {}
-                  if not item.get("video_url"):
-                      continue
-                  if check.get("excluded") or str(check.get("classification") or "").upper() == "HARD_EXCLUDE":
-                      continue
-                  eligible.append(item)
-              if not eligible:
-                  raise SystemExit("FIND returned no ranked candidate with usable video and no hard-exclusion flag; no analyst/generator calls were made.")
-              candidate = eligible[0]
+              candidate, skipped = select_candidate(candidates)  # legacy ranking order; gate only decides who may proceed
+              if candidate is None:
+                  raise SystemExit("FIND returned no ranked candidate that passes the automatic source gate (video + DIRECT/EXPANDED relevance + no hard exclusion): "
+                                   + "; ".join(skipped[:5]) + ". No analyst/generator calls were made.")
               selection_mode = "automatic_best_valid_ranked"
           cid = str(candidate.get("id") or "").strip()
           if not cid:

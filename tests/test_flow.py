@@ -4,7 +4,7 @@ from cme.brain import BrainError, PatchError, apply_patch, request_atoms
 from cme.offer import load_offer
 from cme.providers import (CallLog, InfraError, ModelRef, ProviderPolicyError, call_with_policy,
                            require_paid)
-from cme.qa import CheckResult, anchor_similarity, file_check, judge_checks, ocr_text_check
+from cme.qa import CheckResult, anchor_similarity, file_check, frame_content_check, judge_checks, ocr_text_check
 from cme.receipt import (PayloadMismatch, ReceiptError, assert_exact_payload, attach_qa, build_receipt,
                          build_video_receipt, overall)
 from cme.run import produce_shot
@@ -45,9 +45,9 @@ class ReceiptTests(unittest.TestCase):
 
     def test_attach_qa_keeps_identity_and_needs_every_must_verified(self):
         r = build_receipt("c1", "r1", 1, 1, self.atoms, "A bright kitchen")
-        partial = attach_qa(r, self.atoms, [CheckResult("q", "PASS"), CheckResult("file", "PASS")])
+        partial = attach_qa(r, self.atoms, [CheckResult("q", "PASS"), CheckResult("frame_content", "PASS", pixels=True)])
         self.assertEqual(overall(partial), "UNVERIFIED")  # MUST atom 'a' was never checked
-        full = attach_qa(r, self.atoms, [CheckResult("q", "PASS"), CheckResult("a", "PASS"), CheckResult("file", "PASS")])
+        full = attach_qa(r, self.atoms, [CheckResult("q", "PASS"), CheckResult("a", "PASS"), CheckResult("frame_content", "PASS", pixels=True)])
         self.assertEqual(r.receipt_id, full.receipt_id)
         self.assertEqual(r.sent_prompt, full.sent_prompt)
         self.assertEqual(overall(full), "PASS")
@@ -62,7 +62,7 @@ class ReceiptTests(unittest.TestCase):
         ok = [CheckResult("q", "PASS"), CheckResult("a", "PASS")]
         failed = attach_qa(r, self.atoms, ok + [CheckResult("ocr", "FAIL")])
         self.assertEqual(overall(failed), "FAILED_QA")
-        notrun = attach_qa(r, self.atoms, ok + [CheckResult("file", "PASS"), CheckResult("ocr", "NOT_RUN")])
+        notrun = attach_qa(r, self.atoms, ok + [CheckResult("frame_content", "PASS", pixels=True), CheckResult("ocr", "NOT_RUN")])
         self.assertEqual(overall(notrun), "UNVERIFIED")
 
 
@@ -212,7 +212,7 @@ class PipelineTests(unittest.TestCase):
         return png_bytes()
 
     def qa(self, path):
-        return [file_check("file", path, (64, 96)), CheckResult("scene", "PASS", True, "judge"),
+        return [file_check("file", path, (64, 96)), frame_content_check("frame_content", path), CheckResult("scene", "PASS", True, "judge"),
                 CheckResult("prod", "PASS", True, "judge"), CheckResult("q1", "PASS", True, "judge")]
 
     def test_pass_path_sends_exact_receipt_text(self):
@@ -230,7 +230,7 @@ class PipelineTests(unittest.TestCase):
     def test_failed_qa_is_not_accepted(self):
         with tempfile.TemporaryDirectory() as d:
             st = new_run("run1")
-            qa = lambda p: [CheckResult("file", "PASS"), CheckResult("ocr", "FAIL")]
+            qa = lambda p: [CheckResult("frame_content", "PASS", pixels=True), CheckResult("ocr", "FAIL")]
             _, _, verdict = produce_shot(offer=self.offer, atoms=self.atoms, shot=1, contract_id="c1", state=st,
                                          out_dir=d, image_provider=self.provider, qa_checks=qa)
             self.assertEqual(verdict, "FAILED_QA")

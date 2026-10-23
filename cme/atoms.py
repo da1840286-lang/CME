@@ -4,6 +4,7 @@ Brain writes atoms, never finished prompts. Code validates, assembles, budgets.
 """
 from __future__ import annotations
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, asdict
 
@@ -125,4 +126,17 @@ def check_claims(atoms, offer) -> dict:
                 errs.append(f"FORBIDDEN_CLAIM: contains '{f}'")
         if errs:
             errors[a.id] = errs
+    return errors
+
+
+def check_language(atoms) -> dict:
+    """Atom text goes straight into an English-trained image prompt: reject non-Latin letters.
+
+    Accented Latin letters (product names) are fine; Cyrillic, CJK, Arabic and the like are not.
+    """
+    errors = {}
+    for a in atoms:
+        bad = sorted({ch for ch in a.text if ch.isalpha() and "LATIN" not in unicodedata.name(ch, "")})
+        if bad:
+            errors[a.id] = [f"NON_ENGLISH_ATOM: atom text must be English; found {''.join(bad[:6])!r}"]
     return errors

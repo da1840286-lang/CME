@@ -93,7 +93,7 @@ def make_openrouter_brain(params: dict, api_key=None, transport=None):
                   "and nothing else. Each atom: id, kind, text (max 120 chars), priority (MUST/SHOULD/MAY), "
                   f"channel (image/motion/qa), shot. Allowed kinds: {', '.join(KINDS)}. "
                   + " ".join(request.get("rules", [])) + " JSON schema: " + json.dumps(request["schema"]))
-        user = {k: request.get(k) for k in ("offer", "brief", "shots", "only_fix", "source_transfer") if request.get(k) is not None}
+        user = {k: request.get(k) for k in ("offer", "brief", "shots", "only_fix", "source_transfer", "mechanism_links") if request.get(k) is not None}
         content, meta = _chat(params, api_key, send,
                               [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user)}],
                               _format(params))

@@ -69,13 +69,13 @@ class VendoredCodeIsTheRealOne(Env):
 
 
 class CandidateRecord(Env):
-    def run(self, *items):
+    def run_candidates(self, *items):
         with self.fake_find(list(items)):
             return F.run_find({"country": "US", "max_requests": 1}, client=T.SocialCrawlTikTokTopAds(api_key="K"),
                               now="2026-10-21T00:00:00Z")["candidates"]
 
     def test_provenance_url_and_real_metrics_are_kept(self):
-        c = self.run(synthetic_post("1001", views=120000, ctr=2.4))[0]
+        c = self.run_candidates(synthetic_post("1001", views=120000, ctr=2.4))[0]
         self.assertEqual(c["metrics"]["views"]["value"], 120000)
         self.assertEqual(c["metrics"]["views"]["source"], "socialcrawl:tiktok_ads_top")
         self.assertEqual(c["metrics"]["views"]["collected_at"], "2026-10-21T00:00:00Z")
@@ -86,14 +86,20 @@ class CandidateRecord(Env):
         self.assertIn("legacy_record", c)
 
     def test_unknown_stays_unknown_not_zero(self):
-        c = self.run(synthetic_post("1002", views=None, ctr=None, cvr=None))[0]
+        c = self.run_candidates(synthetic_post("1002", views=None, ctr=None, cvr=None))[0]
         for name in ("views", "ctr", "cvr"):
             self.assertNotIn(name, c["metrics"])
 
     def test_missing_video_is_none_not_invented(self):
         post = synthetic_post("1003")
         post["post"]["content"]["media_urls"] = []
-        c = self.run(post)[0]
+        record = T.SocialCrawlTikTokTopAds._unwrap_item(post)
+        c = F.to_candidate(
+            {"record": record},
+            {"country": "US", "period": 30, "vertical": "Physical Products"},
+            "2026-10-23T00:00:00Z",
+            "found",
+        )
         self.assertIsNone(c["video_url"])
 
 

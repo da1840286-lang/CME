@@ -1,4 +1,9 @@
-"""Tiered QA. Code checks first. A model judge can add evidence but never grants PASS alone."""
+"""Tiered QA. Code checks first.
+
+PASS needs (a) a code check that looked at the pixels (OCR, blank-frame, anchor similarity), and (b) every MUST
+atom verified. For image atoms (b) can only come from the Judge, so in practice the Judge decides MUST atoms and
+code guards the frame itself (decodes, not blank, no stray text). The Judge alone cannot produce PASS.
+"""
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +23,7 @@ class CheckResult:
     required: bool = True
     source: str = "code"  # code / judge
     detail: str = ""
+    pixels: bool = False  # True only when the check actually looked at the frame content
 
 
 def file_check(check_id, path, expected_size=None, required=True) -> CheckResult:
@@ -32,6 +38,23 @@ def file_check(check_id, path, expected_size=None, required=True) -> CheckResult
     if expected_size and tuple(size) != tuple(expected_size):
         return CheckResult(check_id, "FAIL", required, "code", f"size {size} != {expected_size}")
     return CheckResult(check_id, "PASS", required, "code", f"size {size}")
+
+
+def frame_content_check(check_id, path, min_std=4.0, min_range=32, required=True) -> CheckResult:
+    """Code check on pixels: a blank or near-uniform frame is a failed generation, whatever the Judge says.
+
+    The thresholds are stubs; calibrate them on real frames.
+    """
+    try:
+        with Image.open(path) as im:
+            gray = im.convert("L")
+            std = ImageStat.Stat(gray).stddev[0]
+            lo, hi = gray.getextrema()
+    except Exception as e:
+        return CheckResult(check_id, "FAIL", required, "code", f"cannot read frame content: {e}", True)
+    ok = std >= min_std and (hi - lo) >= min_range
+    return CheckResult(check_id, "PASS" if ok else "FAIL", required, "code",
+                       f"contrast std {std:.1f} range {hi - lo}" + ("" if ok else " (blank or near-uniform frame)"), True)
 
 
 def validate_product_references(paths: Sequence[str | Path]) -> list[str]:
@@ -77,10 +100,10 @@ def anchor_similarity(check_id, prev_path, cur_path, region, min_similarity=0.85
             ca, cb = a.crop(box).resize((32, 32)), b.crop(box).resize((32, 32))
             diff = ImageStat.Stat(ImageChops.difference(ca, cb)).mean[0] / 255.0
     except Exception as e:
-        return CheckResult(check_id, "FAIL", required, "code", f"cannot compare: {e}")
+        return CheckResult(check_id, "FAIL", required, "code", f"cannot compare: {e}", True)
     sim = 1.0 - diff
     status = "PASS" if sim >= min_similarity else "FAIL"
-    return CheckResult(check_id, status, required, "code", f"similarity {sim:.3f} (min {min_similarity})")
+    return CheckResult(check_id, status, required, "code", f"similarity {sim:.3f} (min {min_similarity})", True)
 
 
 def ocr_text_check(check_id, path, text_allowed, ocr=None, max_chars=3, required=True):
@@ -96,8 +119,8 @@ def ocr_text_check(check_id, path, text_allowed, ocr=None, max_chars=3, required
     except Exception as e:
         return CheckResult(check_id, "NOT_RUN", required, "code", f"OCR failed: {e}")
     if text_allowed or len(found) <= max_chars:
-        return CheckResult(check_id, "PASS", required, "code", f"{len(found)} text chars")
-    return CheckResult(check_id, "FAIL", required, "code", f"{len(found)} text chars found, none allowed")
+        return CheckResult(check_id, "PASS", required, "code", f"{len(found)} text chars", True)
+    return CheckResult(check_id, "FAIL", required, "code", f"{len(found)} text chars found, none allowed", True)
 
 
 def judge_checks(path, qa_atoms, judge_fn, required=False):
@@ -166,6 +189,7 @@ def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr
 
     def run(path):
         res = [file_check("file", path, expected_size),
+               frame_content_check("frame_content", path),
                ocr_text_check("no_text", path, text_allowed, ocr=ocr, required=ocr_required)]
         for cid, prev, region, minimum in anchors:
             res.append(anchor_similarity(cid, prev, path, region, minimum))
