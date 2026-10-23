@@ -129,8 +129,8 @@ def main() -> int:
             "candidate_count": len(candidates),
             "candidates": [
                 {"id": c.get("id"), "brand": c.get("brand") or c.get("brand_name"), "title": c.get("title"),
-                 "source_score": c.get("source_score"), "video_available": bool(c.get("video_url"),
-                 ), "source_url": c.get("source_url"),
+                 "source_score": c.get("source_score"), "video_available": bool(c.get("video_url")),
+                 "source_url": c.get("source_url"),
                  "source_check": c.get("source_check")}
                 for c in candidates
             ],
