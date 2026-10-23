@@ -106,16 +106,39 @@ class RadarApp:
 
     def do_find(self, params: dict) -> dict:
         run_id = time.strftime("find-%Y%m%d-%H%M%S")
+        search_params = dict(params or {})
+        # The local Control Center automatically uses the configured OfferCard as
+        # FIND context unless the caller supplies an explicit offer.
+        if not isinstance(search_params.get("offer"), dict) and not any(
+            search_params.get(key) for key in ("target_offer", "offer_name", "product_type", "product_category")
+        ):
+            try:
+                offer_data = json.loads(self.offer_path.read_text(encoding="utf-8"))
+                if isinstance(offer_data, dict):
+                    search_params["offer"] = {
+                        key: offer_data.get(key)
+                        for key in ("name", "product_type", "product_category")
+                        if isinstance(offer_data.get(key), str) and offer_data.get(key).strip()
+                    }
+            except (OSError, ValueError):
+                # FIND can still run from explicit keywords if the optional OfferCard is unavailable.
+                pass
         try:
-            res = find_mod.run_find(params, client=self.find_client)
+            res = find_mod.run_find(search_params, client=self.find_client)
         except find_mod.FindUnavailable as e:
-            self.store.log_run(run_id, "find", params, e.state, e.detail)
+            self.store.log_run(run_id, "find", search_params, e.state, e.detail)
             return {"status": e.state, "detail": e.detail, "how_to_fix": find_mod.find_status()["how_to_fix"]}
         except ValueError as e:
             return {"status": "BAD_REQUEST", "detail": str(e)}
         counts = self.store.ingest(res["candidates"], run_id, "found")
-        self.store.log_run(run_id, "find", res["request"], "OK", json.dumps(counts))
-        return {"status": "OK", **counts, "returned": len(res["candidates"])}
+        strategy = (res.get("stats") or {}).get("discovery_strategy") or {}
+        diagnostics = res.get("diagnostics") or {}
+        self.store.log_run(run_id, "find", res["request"], "OK",
+                           json.dumps({"counts": counts, "diagnostics": diagnostics,
+                                       "supply_search_calls_used": strategy.get("supply_search_calls_used", 0),
+                                       "performance_calls_used": strategy.get("performance_calls_used", 0)}))
+        return {"status": "OK", **counts, "returned": len(res["candidates"]),
+                "diagnostics": diagnostics, "discovery_strategy": strategy}
 
     def do_import(self, body: dict) -> dict:
         run_id = time.strftime("import-%Y%m%d-%H%M%S")
@@ -379,8 +402,8 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--bd
 </header>
 <main><div id="list"></div><div id="detail"><p class="unk">Лента пуста. Нажмите «Найти (FIND)» или импортируйте сохранённый файл discovery.</p></div></main>
 <div id="msg"></div>
-<dialog id="dlgFind"><form method="dialog"><h3>FIND: поиск рекламы (старый движок)</h3>
-<p class="unk">Каждый запуск делает до N платных запросов к SocialCrawl. Ничего не запускается автоматически.</p>
+<dialog id="dlgFind"><form method="dialog"><h3>FIND: поиск товарных рекламных источников</h3>
+<p class="unk">Каждый запуск делает до N платных запросов к SocialCrawl: сначала поиск спонсируемых товарных роликов по ключам и текущему OfferCard, затем Ads Top только после обнаружения релевантного источника. Автоматический анализ здесь не запускается.</p>
 <p>Страна <input id="fCountry" value="US" size="4"> Период <select id="fPeriod"><option>7</option><option selected>30</option><option>180</option></select></p>
 <p>Запросов (макс.) <input id="fReq" type="number" min="1" max="10" value="3" style="width:60px"> Объявлений <input id="fAds" type="number" min="1" max="50" value="20" style="width:60px"></p>
 <p>Ключевые слова (через запятую, необязательно)<br><input id="fKw" size="40"></p>
@@ -458,7 +481,9 @@ function renderDetail(c){const sc=c.source_score,sk=c.source_check,op=c.operator
 $('btnFind').onclick=()=>{const s=S.state?.find;if(s&&s.state!=='READY'){say(`FIND ${s.state}: ${s.detail}. ${s.how_to_fix}`,true)}$('dlgFind').showModal()};
 $('dlgFind').addEventListener('close',async()=>{if($('dlgFind').returnValue!=='go')return;say('Поиск выполняется…');
  const r=await api('POST','/api/find',{country:$('fCountry').value,period:+$('fPeriod').value,max_requests:+$('fReq').value,max_ads:+$('fAds').value,keywords:$('fKw').value.split(',').map(x=>x.trim()).filter(Boolean)});
- say(r.status==='OK'?`Найдено: новых ${r.new}, обновлено ${r.updated}`:`${r.status}: ${r.detail||''} ${r.how_to_fix||''}`,r.status!=='OK');await loadFeed()});
+ const d=r.diagnostics||{};
+ const note=r.status==='OK'?(r.returned>0?`Найдено: новых ${r.new}, обновлено ${r.updated}. FIND ${d.outcome||'OK'}; DIRECT ${d.direct_relevant_ads??'н/д'}, EXPANDED ${d.expanded_relevant_ads??'н/д'}.`:`FIND ${d.outcome||'без кандидатов'}: API-строк ${d.raw_ads_returned??0}; DIRECT ${d.direct_relevant_ads??0}; EXPANDED ${d.expanded_relevant_ads??0}; непроверенных ${d.unverified_ads??0}. ${d.explanation||''}${(d.search_queries_executed||[]).length?' Запросы: '+d.search_queries_executed.join(', '):''}`):`${r.status}: ${r.detail||''} ${r.how_to_fix||''}`;
+ say(note,r.status!=='OK'||!r.returned);await loadFeed()});
 $('btnImport').onclick=()=>$('dlgImp').showModal();
 $('dlgImp').addEventListener('close',async()=>{if($('dlgImp').returnValue!=='go')return;const r=await api('POST','/api/import',{path:$('iPath').value});
  say(r.status==='OK'?`Импортировано: новых ${r.new}, обновлено ${r.updated} (помечены как «импорт»)`:`${r.status}: ${r.detail}`,r.status!=='OK');await loadFeed()});

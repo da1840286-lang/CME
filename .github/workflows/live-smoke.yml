@@ -29,7 +29,7 @@ on:
         required: true
         default: "30"
       find_requests:
-        description: "Maximum SocialCrawl API requests for FIND; 4 allows one keyword query"
+        description: "Hard cap on SocialCrawl requests. FIND searches sponsored product sources first; Ads Top is used only after target relevance appears."
         type: number
         required: true
         default: 4
@@ -417,11 +417,15 @@ jobs:
           from cme.radar.find import run_find
 
           keywords = [x.strip() for x in os.environ.get("FIND_KEYWORDS", "").split(",") if x.strip()]
+          raw_offer = os.environ.get("OFFER_JSON_INPUT", "").strip()
+          offer_data = json.loads(raw_offer) if raw_offer else {}
+          if not isinstance(offer_data, dict):
+              raise SystemExit("offer_json must be a JSON object")
           params = {"country": os.environ["FIND_COUNTRY"].upper(),
                     "period": int(os.environ["FIND_PERIOD"]),
                     "max_requests": int(os.environ["FIND_REQUESTS"]),
                     "max_ads": int(os.environ["FIND_MAX_ADS"]),
-                    "keywords": keywords, "discovery_mode": "auto"}
+                    "keywords": keywords, "offer": offer_data, "discovery_mode": "auto"}
           result = run_find(params)
           out = Path("out")
           (out / "candidates.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -439,7 +443,17 @@ jobs:
               s.write("## TikTok FIND results\n\n")
               s.write(f"Country: {params['country']} · Period: {params['period']} days · Request cap: {params['max_requests']} · Candidate cap: {params['max_ads']} · Keywords: {', '.join(keywords) or 'broad Top Ads'}\n\n")
               if not rows:
-                  s.write("No ads returned. Check SocialCrawl credentials/credits or adjust keywords.\n")
+                  stats = result.get("stats") or {}
+                  diag = result.get("diagnostics") or {}
+                  queries = diag.get("search_queries_executed") or []
+                  if diag.get("raw_ads_returned", 0):
+                      s.write(f"SocialCrawl returned {diag['raw_ads_returned']} raw ad row(s), but none passed the target-source selection rules.\n\n")
+                  else:
+                      s.write("SocialCrawl returned no raw ad rows for the planned source queries.\n\n")
+                  s.write(f"Diagnosis: `{diag.get('outcome', 'UNKNOWN')}` — {diag.get('explanation', 'No additional FIND diagnostics available')}\n\n")
+                  s.write(f"Requests: {diag.get('requests_executed', 0)}; unique ads: {diag.get('unique_ads', 0)}; DIRECT: {diag.get('direct_relevant_ads', 0)}; EXPANDED: {diag.get('expanded_relevant_ads', 0)}; UNVERIFIED: {diag.get('unverified_ads', 0)}; hard-excluded: {diag.get('hard_excluded_ads', 0)}.\n\n")
+                  if queries:
+                      s.write("Sponsored Search queries tried: " + ", ".join(queries) + "\n\n")
               for c in rows:
                   title = str(c.get("title") or "(no title)").replace("\n", " ")[:160]
                   brand = str(c.get("brand") or "unknown brand")[:80]
@@ -474,11 +488,15 @@ jobs:
                   # Full automatic run: FIND and its handoff stay in this same Actions job.
                   from cme.radar.find import run_find
                   keywords = [x.strip() for x in os.environ.get("FIND_KEYWORDS", "").split(",") if x.strip()]
+                  raw_offer = os.environ.get("OFFER_JSON_INPUT", "").strip()
+                  offer_data = json.loads(raw_offer) if raw_offer else {}
+                  if not isinstance(offer_data, dict):
+                      raise SystemExit("offer_json must be a JSON object")
                   params = {"country": os.environ["FIND_COUNTRY"].upper(),
                             "period": int(os.environ["FIND_PERIOD"]),
                             "max_requests": int(os.environ["FIND_REQUESTS"]),
                             "max_ads": int(os.environ["FIND_MAX_ADS"]),
-                            "keywords": keywords, "discovery_mode": "auto"}
+                            "keywords": keywords, "offer": offer_data, "discovery_mode": "auto"}
                   find_result = run_find(params)
                   candidates_file.write_text(json.dumps(find_result, ensure_ascii=False, indent=2), encoding="utf-8")
                   rows = []
@@ -503,8 +521,20 @@ jobs:
               candidates = json.loads(candidates_file.read_text(encoding="utf-8")).get("candidates", [])
               candidate, skipped = select_candidate(candidates)  # legacy ranking order; gate only decides who may proceed
               if candidate is None:
+                  stats = json.loads(candidates_file.read_text(encoding="utf-8")).get("stats") or {}
+                  diag = json.loads(candidates_file.read_text(encoding="utf-8")).get("diagnostics") or {}
+                  calls = stats.get("calls") or []
+                  raw_returned = sum(int(call.get("returned") or 0) for call in calls if isinstance(call, dict))
+                  strategy = stats.get("discovery_strategy") or {}
+                  tried = strategy.get("supply_queries_executed") or []
+                  diagnosis = (f"FIND diagnosis={diag.get('outcome', 'UNKNOWN')}; raw_rows={raw_returned}; "
+                               f"unique_ads={stats.get('unique_ads', 0)}; direct={stats.get('direct_relevant_ads', 0)}; "
+                               f"expanded={stats.get('expanded_relevant_ads', 0)}; unverified={stats.get('unverified_ads', 0)}; "
+                               f"hard_excluded={stats.get('pre_visual_verification_hard_excluded_ads', 0)}; "
+                               f"sponsored_queries={tried}. ")
+                  skip_text = "; ".join(skipped[:5]) or "FIND returned no ranked candidates to evaluate."
                   raise SystemExit("FIND returned no ranked candidate that passes the automatic source gate (video + DIRECT/EXPANDED relevance + no hard exclusion): "
-                                   + "; ".join(skipped[:5]) + ". No analyst/generator calls were made.")
+                                   + skip_text + " " + diagnosis + "No analyst/generator calls were made.")
               selection_mode = "automatic_best_valid_ranked"
           cid = str(candidate.get("id") or "").strip()
           if not cid:
