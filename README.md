@@ -160,26 +160,36 @@ Brain может получить компактный контекст из п�
 - `atoms_manifest.json` привязывает хэш атомов и фотографии к офферу/контракту. Если атомы в `out/atoms.json` изменены, `frame` блокируется; `--atoms` с внешним файлом остаётся `TEST_ONLY`.
 - Коды возврата `6` (`UNVERIFIED`) и `7` (`FAILED_QA` / `NOT_DELIVERED`) означают, что артефакты сохранены, но проверка не завершилась успешным `PASS`.
 
-## Ручной live запуск через GitHub Actions
+## Live запуск только через GitHub Actions (без локального запуска)
 
-Workflow `.github/workflows/live-smoke.yml` запускается вручную через **Actions → CME live smoke → Run workflow**. Он не запускается на каждый push и не меняет обычный офлайн CI. В выборе **Use workflow from** выбери ветку `feat/legacy-transfer-product-identity-qa-2026-10-22` или ту ветку, в которой находятся эти изменения.
+Открой **Actions → CME live smoke → Run workflow** и выбери ветку `feat/legacy-transfer-product-identity-qa-2026-10-22`. Для реального запуска нужны repository secrets:
 
-### Перед первым запуском
+- `SOCIALCRAWL_API_KEY` — TikTok FIND;
+- `OPENROUTER_API_KEY` — анализ ролика, Brain и Judge;
+- `HF_TOKEN` — генерация изображений.
 
-1. В **Settings → Secrets and variables → Actions** создай два repository secrets: `OPENROUTER_API_KEY` и `HF_TOKEN`. Ключи не вставляй в поля запуска или файлы.
-2. Настоящее фото товара должно быть доступно в выбранной ветке по пути внутри репозитория, например `offers/car-vacuum/front.jpg`. Путь указывается относительно корня репозитория и прописывается в `photos` в OfferCard JSON. Текущий репозиторий публичный: закоммиченное фото будет публичным.
-3. В поле `offer_json` вставь JSON карточки своего целевого товара (`offer_id`, `name`, `product_type`, непустой `verified_claims`, `photos`; при необходимости `forbidden_claims`, `platform`, `geo`, `product_category`, `confirmations`). Не используй `examples/offer_example.json`: его фото — заглушка, которая блокирует запуск.
-4. В поле `source_contract_json` вставь JSON результата анализа рекламы из локального Creative Radar — объект `analyses[].result` с полями вроде `mechanism_hypothesis` / `transferability` — либо принятый старый CME transfer contract с `mechanism`, `transfer`, `rebuild_plan` или `image_creative_contract`. В локальном Radar открыть `http://127.0.0.1:8765/api/candidate?id=ID_ОБЪЯВЛЕНИЯ` и взять результат нужного анализа. Для старого контракта проверка `source_review.source_verification`, если она обязательная, всё так же должна иметь `status=PASS`.
+### 1. Найти рекламу TikTok
 
-В workflow доступны три режима:
+Выбери `stage=find`. На первом тесте оставь `country=US`, `period=30`, `find_requests=4`, `find_max_ads=3`, `keywords=car vacuum`. Четыре запроса нужны, чтобы старый ранжировщик успел проверить широкую выдачу и один запрос по ключевому слову; SocialCrawl может списать кредиты. В summary запуска появятся `candidate_id`, бренд, заголовок, рейтинг и ссылка на рекламу. Выбирай кандидата с `video=yes`.
 
-- **`brain`** — проверяет OfferCard, настоящее фото и source contract до обращения к модели, затем создаёт `atoms.json` и `atoms_manifest.json`. Артефакт: `cme-brain-out`. Просмотри атомы перед генерацией.
-- **`frame`** — генерирует один кадр из успешного Brain-артефакта. Введи его числовой **Workflow run ID** в `brain_run_id`. Для повторной попытки укажи `previous_frame_run_id`; workflow восстановит state и лимит попыток. Запуск разрешён только с той же ветки и того же commit SHA, что и Brain.
-- **`all`** — полный путь за один запуск: source contract → Brain → атомы → выбранное число последовательных кадров → QA. `shots` принимает 1–6, по умолчанию 1. Нужны оба ключа. Используй этот режим, когда хочешь запустить весь процесс без отдельного шага `frame`.
+### 2. Анализ и кадр без локального Radar
 
-Перед генерацией workflow проверяет JSON, наличие и качество фото, совместимость manifest с оффером и происхождение артефактов. Ошибка на этом этапе не расходует квоту провайдеров. Сырой `source_contract.json` удаляется перед загрузкой артефакта; в manifest остаётся его хэш. Выход, кадры, квитанции, состояние и журнал вызовов хранятся в артефакте 7 дней.
+Повторно нажми **Run workflow** и укажи:
 
-`no_ocr_required` по умолчанию выключен. Если его включить, отсутствие OCR не будет обязательным блокирующим условием, но все проверки и их статусы останутся в receipts. Код возврата CME `6` означает `UNVERIFIED`, `7` — провал QA/доставки; GitHub job будет красным, а артефакты сохранятся. Адаптеры в текущей конфигурации бесплатные и не подтверждены для коммерческого использования, поэтому успешный результат остаётся `TEST_ONLY`: проверь изображения и receipts вручную.
+- `stage=all`
+- `find_run_id` — числовой Run ID предыдущего успешного запуска `find`
+- `candidate_id` — ID выбранной рекламы из summary
+- `shots=1`
+
+Оффер по умолчанию — тестовый **Fanttik V8 Mate Cordless Car Vacuum**. Workflow автоматически скачивает фотографию товара по `target_photo_url` во время запуска; сохранять изображение в репозитории или запускать CME локально не нужно. Фото берётся с [официальной страницы Fanttik V8 Mate](https://fanttik.com/products/fanttik-v8-mate-upgraded-cordless-car-vacuum). Поле принимает прямой HTTPS URL изображения, не страницу магазина. Для другого товара измени `offer_json` и `target_photo_url`; добавляй в `verified_claims` только проверенные характеристики.
+
+В этом запуске GitHub загрузит видео выбранного объявления, проведёт анализ по шести кадрам, передаст гипотезу механизма в существующий Brain → атомы → генерацию кадра → QA. Сырые source URL и локальные видео не кладутся в отдельный source-contract артефакт; сохраняются анализ, атомы, manifest, изображения, receipts и журналы.
+
+### 3. Что смотреть после выполнения
+
+Открой **Artifacts → `cme-all-out`** и проверь `live_result.json`, `source_analysis.json`, изображения в `production/` и receipts. `UNVERIFIED` и `FAILED_QA` — не успешный кадр. Не включай больше одного кадра на первом запуске. Существующие этапы `brain` / `frame` и передача уже сохранённого source contract тоже остаются доступными.
+
+Обычный CI не запускает платные сервисы. Live workflow запускается только вручную.
 ## Выбор адаптера для тестов
 
 `adapters.json` содержит бесплатный `hf_zerogpu_flux2_klein` и платные `fal_flux2_pro`, `fal_seedream`.
