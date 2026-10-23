@@ -9,6 +9,7 @@ from cme.radar.legacy import discover as legacy_discover
 from cme.radar.legacy.discovery import tiktok_socialcrawl as T
 from cme.radar.server import RadarApp, make_server
 from cme.radar.store import Store
+from tests.helpers import png_bytes
 from tests.radar_fixtures import FakeResp, synthetic_post, synthetic_response
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -256,7 +257,8 @@ def analyst_transport(calls, content=None, status=200):
     return send
 
 
-class ManualAnalysis(Env):
+class RadarAppFixture(Env):
+    """Shared setup only; keep fixture tests from being inherited and run twice."""
     def make_app(self, calls, **kw):
         s = json.loads((ROOT / "settings.example.json").read_text())
         sp = Path(self.tmp.name) / "settings.json"
@@ -269,6 +271,8 @@ class ManualAnalysis(Env):
         app.store.ingest(res["candidates"], "run", "found")
         return app, res["candidates"][0]["id"]
 
+
+class ManualAnalysis(RadarAppFixture):
     def test_nothing_calls_the_model_until_the_operator_asks(self):
         calls = []
         app, cid = self.make_app(calls)
@@ -353,6 +357,66 @@ class ManualAnalysis(Env):
         self.assertTrue(all(Path(f["path"]).stat().st_size > 500 and len(f["sha256"]) == 64 for f in frames))
 
 
+class ProductionHandoff(RadarAppFixture):
+    def test_handoff_requires_shortlist_and_real_target_product_photo_before_provider_calls(self):
+        calls = []
+        app, cid = self.make_app(calls)
+        self.assertEqual(app.do_produce(cid)["status"], "NOT_SHORTLISTED")
+        self.assertEqual(app.do_analyze(cid)["status"], "OK")
+        app.store.decide(cid, "shortlist", "commercial mechanism worth testing")
+        # The default example photo is deliberately a flat placeholder; do not waste a Brain/provider call.
+        with mock.patch("cme.radar.server.subprocess.run") as run:
+            result = app.do_produce(cid)
+        self.assertEqual(result["status"], "TARGET_PHOTO_BLOCKED")
+        self.assertEqual(result["provider_calls_made"], 0)
+        run.assert_not_called()
+
+    def test_shortlisted_analyzed_source_hands_off_to_existing_atom_cli_and_keeps_artifact_preview(self):
+        calls = []
+        app, cid = self.make_app(calls)
+        self.assertEqual(app.do_analyze(cid)["status"], "OK")
+        app.store.decide(cid, "shortlist", "test the transfer hypothesis")
+        photo = Path(self.tmp.name) / "target-product.png"
+        photo.write_bytes(png_bytes(patch=((0, 0, 32, 48), (240, 15, 70))))
+        offer_path = Path(self.tmp.name) / "offer.json"
+        offer_path.write_text(json.dumps({"offer_id": "target-vacuum-test", "name": "Cordless car vacuum",
+                                          "product_type": "car-cleaning vacuum", "verified_claims": ["Cordless"],
+                                          "forbidden_claims": ["guaranteed"], "photos": [str(photo)], "geo": "US"}), encoding="utf-8")
+        app.offer_path = offer_path
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            out = Path(cmd[cmd.index("--out") + 1])
+            source_path = Path(cmd[cmd.index("--source-contract") + 1])
+            seen["handoff"] = json.loads(source_path.read_text(encoding="utf-8"))
+            (out / "shots").mkdir(parents=True)
+            (out / "shots" / "shot_01_a01.png").write_bytes(png_bytes(patch=((0, 0, 20, 20), (15, 220, 60))))
+            (out / "receipts").mkdir()
+            (out / "receipts" / "drec_synthetic.json").write_text(json.dumps({"receipt_id": "drec_synthetic", "shot": 1,
+                  "overall": "PASS", "commercial_status": "TEST_ONLY", "image_path": str(out / "shots" / "shot_01_a01.png")}), encoding="utf-8")
+            (out / "calls.jsonl").write_text('{"status":"ok"}\n{"status":"ok"}\n{"status":"ok"}\n', encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="Brain atoms delivered; frame QA PASS", stderr="")
+
+        with mock.patch("cme.radar.server.subprocess.run", side_effect=fake_run) as run:
+            report = app.do_produce(cid)
+        self.assertEqual(report["status"], "OK")
+        self.assertEqual(report["provider_calls_made"], 3)
+        self.assertEqual(report["images"], ["shot_01_a01.png"])
+        self.assertEqual(report["verdicts"][0]["overall"], "PASS")
+        self.assertEqual(report["verdicts"][0]["commercial_status"], "TEST_ONLY")
+        self.assertEqual(seen["cmd"][seen["cmd"].index("all")], "all")
+        self.assertEqual(seen["cmd"][seen["cmd"].index("--offer") + 1], str(offer_path))
+        self.assertEqual(seen["cmd"][seen["cmd"].index("--source-contract") + 1], str(Path(app.data_dir) / "production" / report["run_id"] / "source_contract.json"))
+        handoff_text = json.dumps(seen["handoff"], ensure_ascii=False)
+        self.assertIn("mechanism_hypothesis", handoff_text)
+        self.assertNotIn("source_url", handoff_text)
+        self.assertNotIn("video_url", handoff_text)
+        self.assertNotIn(app.candidate(cid)["analyses"][0]["material"]["frames"][0]["path"], handoff_text)
+        self.assertEqual(app.productions(cid)[0]["run_id"], report["run_id"])
+        run.assert_called_once()
+
+
 class Server(ManualAnalysis):
     def start(self, calls):
         app, cid = self.make_app(calls)
@@ -409,6 +473,29 @@ class Server(ManualAnalysis):
         self.assertEqual(sl["items"][0]["operator"]["reason"], "good")
         _, state = self.req(port, "GET", "/api/state")
         self.assertEqual(state["counts"]["saved"], 1)
+
+    def test_production_preview_route_only_serves_known_png_artifacts(self):
+        app, cid, port = self.start([])
+        run_id = "prod-previewtest"
+        image = Path(app.data_dir) / "production" / run_id / "shots" / "shot_01_a01.png"
+        image.parent.mkdir(parents=True)
+        payload = png_bytes(patch=((0, 0, 24, 30), (240, 20, 80)))
+        image.write_bytes(payload)
+        report = image.parents[1] / "production.json"
+        report.write_text(json.dumps({"run_id": run_id, "candidate_id": cid, "started_at": "2026-10-23T00:00:00Z",
+                                      "images": [image.name], "status": "OK"}), encoding="utf-8")
+        code, data = self.req(port, "GET", f"/api/productions?id={cid}")
+        self.assertEqual(code, 200)
+        self.assertEqual(data["items"][0]["run_id"], run_id)
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("GET", f"/api/production-file?run={run_id}&name={image.name}")
+        response = conn.getresponse()
+        body = response.read()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader("Content-Type"), "image/png")
+        self.assertEqual(body, payload)
+        conn.close()
+        self.assertEqual(self.req(port, "GET", f"/api/production-file?run={run_id}&name=..%2F..%2Fradar.db")[0], 400)
 
     def test_server_refuses_non_local_binding(self):
         app, _cid = self.make_app([])

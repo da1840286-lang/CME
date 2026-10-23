@@ -3,14 +3,20 @@
 Nothing runs by itself: FIND, analysis and every decision are explicit operator actions.
 """
 from __future__ import annotations
+import hashlib
 import json
 import os
+import re
 import secrets
+import subprocess
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from ..offer import OfferError, load_offer
 from ..providers import CallLog, ProviderPolicyError
+from ..qa import validate_product_references
 from ..registry import load_catalog, load_settings, make_analyst
 from . import analyze as analyze_mod
 from . import find as find_mod
@@ -27,14 +33,33 @@ class NotConfigured(Exception):
 
 class RadarApp:
     def __init__(self, data_dir, settings_path=None, catalog_path=None, ctx=None, find_client=None, getter=None,
-                 runner=None, tools=None):
+                 runner=None, tools=None, offer_path=None, vertical_path=None, production_shots=1):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.store = Store(self.data_dir / "radar.db")
-        self.settings_path = Path(settings_path or ROOT / "settings.json")
-        self.catalog_path = Path(catalog_path or ROOT / "adapters.json")
+        self.settings_path = self._root_path(settings_path or ROOT / "settings.json")
+        self.catalog_path = self._root_path(catalog_path or ROOT / "adapters.json")
+        self.offer_path = self._root_path(offer_path or ROOT / "examples" / "offer_example.json")
+        self.vertical_path = self._root_path(vertical_path or ROOT / "verticals" / "physical_goods_us.json")
+        if type(production_shots) is not int or not 1 <= production_shots <= 6:
+            raise ValueError("production_shots must be an integer from 1 to 6")
+        self.production_shots = production_shots
         self.ctx, self.find_client, self.getter, self.runner, self.tools = ctx or {}, find_client, getter, runner, tools
         self.token = secrets.token_urlsafe(16)
+
+    @staticmethod
+    def _root_path(value):
+        path = Path(value)
+        return path if path.is_absolute() else ROOT / path
+
+    def production_status(self) -> dict:
+        try:
+            offer = load_offer(self.offer_path)
+            issues = validate_product_references(offer.photos)
+            return {"state": "READY" if not issues else "BLOCKED", "offer_id": offer.offer_id,
+                    "name": offer.name, "photo_issues": issues, "shots": self.production_shots}
+        except (OSError, ValueError, OfferError) as e:
+            return {"state": "NOT_CONFIGURED", "name": "", "photo_issues": [str(e)], "shots": self.production_shots}
 
     # ---- analyst (built only when the operator presses Analyze) ---------------------------
     def _analyst(self):
@@ -65,7 +90,7 @@ class RadarApp:
     def state(self) -> dict:
         return {"vertical": find_mod.VERTICAL, "counts": self.store.counts(), "find": find_mod.find_status(),
                 "analyst": self.analyst_status(), "tools": self.tools or analyze_mod.tools_status(),
-                "metric_fields": list(find_mod.METRIC_FIELDS)}
+                "production": self.production_status(), "metric_fields": list(find_mod.METRIC_FIELDS)}
 
     def feed(self, q: dict) -> list:
         g = lambda k, d="": (q.get(k) or [d])[0]  # noqa: E731
@@ -115,6 +140,102 @@ class RadarApp:
         return analyze_mod.analyze_candidate(self.store, cid, call, self.data_dir, analyst_info=lambda: call.info,
                                              getter=self.getter, runner=self.runner, tools=self.tools)
 
+    def productions(self, cid: str) -> list:
+        """Read production reports for one candidate; do not expose other local files."""
+        self.store._need(cid)
+        root = self.data_dir / "production"
+        reports = []
+        if not root.is_dir():
+            return reports
+        for path in root.glob("*/production.json"):
+            try:
+                item = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if item.get("candidate_id") == cid:
+                reports.append(item)
+        return sorted(reports, key=lambda x: x.get("started_at", ""), reverse=True)
+
+    def do_produce(self, cid: str) -> dict:
+        """Explicit handoff: shortlisted ad + accepted sampled-frame analysis -> existing atom/image CLI."""
+        c = self.candidate(cid)
+        if c["operator"].get("state") != "shortlist":
+            return {"status": "NOT_SHORTLISTED", "detail": "first move this source ad to Shortlist"}
+        analysis = next((x for x in c["analyses"] if x.get("status") == "OK" and isinstance(x.get("result"), dict)), None)
+        if analysis is None:
+            return {"status": "NO_VALID_ANALYSIS", "detail": "analyze the selected source video first; no valid analysis is saved"}
+        material = analysis.get("material") or {}
+        if not material.get("video_sha256") or not material.get("frames"):
+            return {"status": "SOURCE_EVIDENCE_INCOMPLETE", "detail": "analysis has no saved video hash / sampled-frame evidence"}
+        try:
+            offer = load_offer(self.offer_path)
+        except (OSError, ValueError, OfferError) as e:
+            return {"status": "TARGET_OFFER_INVALID", "detail": str(e)}
+        ref_issues = validate_product_references(offer.photos)
+        if ref_issues:
+            return {"status": "TARGET_PHOTO_BLOCKED", "detail": "; ".join(ref_issues), "provider_calls_made": 0}
+        if not self.settings_path.is_file():
+            return {"status": "NOT_CONFIGURED", "detail": f"{self.settings_path.name} not found; copy settings.example.json to settings.json"}
+        # Only the validated analysis result crosses the boundary. Source URLs, local video/frame paths,
+        # source brand identity and raw source prompts remain in Radar storage, not in the Brain payload.
+        handoff = {"status": "OK", "candidate_id": cid, "analysis_id": analysis.get("n"),
+                   "result": analysis["result"],
+                   "source_scope": "sampled frames only; mechanism and transferability remain hypotheses"}
+        run_id = "prod-" + time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(4)
+        out = self.data_dir / "production" / run_id
+        out.mkdir(parents=True, exist_ok=False)
+        source_path = out / "source_contract.json"
+        source_bytes = json.dumps(handoff, ensure_ascii=False, indent=2).encode("utf-8")
+        source_path.write_bytes(source_bytes)
+        brief = ("Create target-native product-ad frames for the configured OfferCard. Preserve the source's causal "
+                 "commercial mechanism, but replace its product, creator, brand, props, scene, wording and composition. "
+                 "Show the configured target product clearly; use only verified OfferCard facts and visible evidence.")
+        cmd = [sys.executable, "-m", "cme.smoke", "all", "--offer", str(self.offer_path),
+               "--settings", str(self.settings_path), "--catalog", str(self.catalog_path),
+               "--vertical", str(self.vertical_path), "--out", str(out), "--source-contract", str(source_path),
+               "--brief", brief, "--shots", str(self.production_shots), "--run-id", run_id]
+        started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        report = {"run_id": run_id, "candidate_id": cid, "analysis_id": analysis.get("n"), "started_at": started,
+                  "status": "RUNNING", "exit_code": None, "offer_id": offer.offer_id, "offer_name": offer.name,
+                  "source_contract_sha256": hashlib.sha256(source_bytes).hexdigest(), "images": [], "verdicts": [],
+                  "stdout_tail": "", "stderr_tail": "", "provider_calls_made": 0}
+        report_path = out / "production.json"
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            res = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=900, check=False)
+            report["exit_code"] = int(res.returncode)
+            report["stdout_tail"] = (res.stdout or "")[-5000:]
+            report["stderr_tail"] = (res.stderr or "")[-2000:]
+            report["status"] = {0: "OK", 2: "INFRA_ERROR", 3: "BLOCKED", 4: "ATOM_CONTRACT_FAILED",
+                                5: "PROVIDER_ERROR", 6: "UNVERIFIED", 7: "FAILED_QA"}.get(res.returncode, "FAILED")
+        except subprocess.TimeoutExpired as e:
+            report["status"] = "TIMEOUT"
+            report["stderr_tail"] = str(e)[:2000]
+        except OSError as e:
+            report["status"] = "LOCAL_EXECUTION_ERROR"
+            report["stderr_tail"] = f"{type(e).__name__}: {e}"
+        finally:
+            report["images"] = [p.name for p in sorted((out / "shots").glob("shot_*.png"))] if (out / "shots").is_dir() else []
+            if report["exit_code"] == 0 and not report["images"]:
+                report["status"] = "NO_IMAGE_OUTPUT"
+            report["verdicts"] = []
+            receipt_root = out / "receipts"
+            for receipt_path in sorted(receipt_root.glob("*.json")) if receipt_root.is_dir() else []:
+                try:
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if receipt.get("image_path") or receipt.get("receipt_id"):
+                    report["verdicts"].append({"receipt_id": receipt.get("receipt_id", receipt_path.stem),
+                                               "shot": receipt.get("shot"), "overall": receipt.get("overall"),
+                                               "commercial_status": receipt.get("commercial_status")})
+            calls_path = out / "calls.jsonl"
+            if calls_path.is_file():
+                report["provider_calls_made"] = sum(1 for line in calls_path.read_text(encoding="utf-8").splitlines() if line.strip())
+            report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        return report
+
 
 class Handler(BaseHTTPRequestHandler):
     app: RadarApp = None  # set by make_server
@@ -160,6 +281,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"items": [slim(c) for c in self.app.feed(q)]})
             if u.path == "/api/candidate":
                 return self._json(200, self.app.candidate((q.get("id") or [""])[0]))
+            if u.path == "/api/productions":
+                return self._json(200, {"items": self.app.productions((q.get("id") or [""])[0])})
+            if u.path == "/api/production-file":
+                run_id, name = (q.get("run") or [""])[0], (q.get("name") or [""])[0]
+                if not re.fullmatch(r"prod-[A-Za-z0-9_-]{1,80}", run_id) or not re.fullmatch(r"shot_\d{2}_a\d{2}\.png", name):
+                    return self._json(400, {"error": "invalid production image reference"})
+                root = (self.app.data_dir / "production" / run_id / "shots").resolve()
+                image_path = (root / name).resolve()
+                if not image_path.is_relative_to(root) or not image_path.is_file():
+                    return self._json(404, {"error": "production image not found"})
+                return self._send(200, image_path.read_bytes(), "image/png")
         except KeyError as e:
             return self._json(404, {"error": f"not found: {e}"})
         except Exception as e:  # never drop the connection: report it
@@ -184,6 +316,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True})
             if p == "/api/analyze":
                 return self._json(200, self.app.do_analyze(body.get("id", "")))
+            if p == "/api/produce":
+                return self._json(200, self.app.do_produce(body.get("id", "")))
             if p == "/api/find":
                 return self._json(200, self.app.do_find(body))
             if p == "/api/import":
@@ -240,7 +374,7 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--bd
 <select id="origin"><option value="">Источник: все</option><option value="found">найдено поиском</option><option value="imported">импортировано</option></select>
 <select id="period"><option value="">Период: все</option><option>7</option><option>30</option><option>180</option></select>
 <input id="q" placeholder="Поиск: товар, бренд" size="18">
-<span id="counts" class="badge"></span>
+<span id="counts" class="badge"></span><span id="targetOffer" class="badge"></span>
 <button id="btnFind" class="primary">Найти (FIND)</button><button id="btnImport">Импорт файла</button>
 </header>
 <main><div id="list"></div><div id="detail"><p class="unk">Лента пуста. Нажмите «Найти (FIND)» или импортируйте сохранённый файл discovery.</p></div></main>
@@ -256,20 +390,20 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--bd
 <p><input id="iPath" size="50" placeholder="/путь/к/tiktok_discovery.json"></p>
 <p><button value="go" class="primary">Импортировать</button> <button value="cancel">Отмена</button></p></form></dialog>
 <script>
-const TOKEN="__TOKEN__";let S={items:[],i:-1,state:null};
+const TOKEN="__TOKEN__";let S={items:[],i:-1,state:null,selectedId:null};
 const $=id=>document.getElementById(id);
 function el(t,a,...k){const e=document.createElement(t);for(const[x,v]of Object.entries(a||{})){if(x==='class')e.className=v;else if(x==='on')for(const[ev,fn]of Object.entries(v))e.addEventListener(ev,fn);else e.setAttribute(x,v)}for(const c of k.flat())if(c!=null)e.append(c.nodeType?c:document.createTextNode(String(c)));return e}
 async function api(m,p,b){const r=await fetch(p,{method:m,headers:{'Content-Type':'application/json','X-Radar-Token':TOKEN},body:b?JSON.stringify(b):undefined});return r.json()}
 function say(t,bad){const m=$('msg');m.textContent=t;m.className=bad?'warn':''}
 const UNK=v=>v===null||v===undefined||v===''?el('span',{class:'unk'},'н/д'):String(typeof v==='number'?Math.round(v*100)/100:v);
-async function refreshState(){S.state=await api('GET','/api/state');const c=S.state.counts;$('counts').textContent=`найдено ${c.found} · просмотрено ${c.viewed} · в shortlist ${c.saved}`}
+async function refreshState(){S.state=await api('GET','/api/state');const c=S.state.counts;$('counts').textContent=`найдено ${c.found} · просмотрено ${c.viewed} · в shortlist ${c.saved}`;const p=S.state.production||{};$('targetOffer').textContent=`Оффер: ${p.name||'не настроен'} · фото: ${p.state==='READY'?'PASS':p.state==='BLOCKED'?'BLOCKED':'проверить'}`}
 function qs(){const p=new URLSearchParams({state:$('tab').value,country:$('country').value.trim(),platform:$('platform').value,origin:$('origin').value,period:$('period').value,q:$('q').value.trim()});return p.toString()}
 async function loadFeed(keepId){const r=await api('GET','/api/feed?'+qs());S.items=r.items;let i=keepId?S.items.findIndex(x=>x.id===keepId):-1;renderList();if(S.items.length)select(i>=0?i:0,true);else{S.i=-1;$('detail').replaceChildren(el('p',{class:'unk'},'Нет кандидатов по текущим фильтрам.'))}await refreshState()}
 function renderList(){const L=$('list');L.replaceChildren(...S.items.map((c,i)=>el('div',{class:'item'+(i===S.i?' sel':''),on:{click:()=>select(i)}},
  c.cover_url?el('img',{src:c.cover_url,loading:'lazy',referrerpolicy:'no-referrer',alt:'',on:{error:e=>e.target.replaceWith(el('div',{class:'pill'},'превью недоступно'))}}):el('div',{class:'pill'},'нет превью'),
  el('div',{class:'t'},el('b',{},c.brand_name||c.brand||'бренд н/д'),el('span',{},c.title||'название н/д'),el('span',{class:'pill'},(c.origin==='imported'?'импорт · ':'')+(c.operator.viewed?'просмотрено':'новое'))))))}
-async function select(i,quiet){if(i<0||i>=S.items.length)return;S.i=i;renderList();const c=S.items[i];document.querySelectorAll('.item')[i]?.scrollIntoView({block:'nearest'});
- await api('POST','/api/view',{id:c.id});const full=await api('GET','/api/candidate?id='+encodeURIComponent(c.id));renderDetail(full)}
+async function select(i,quiet){if(i<0||i>=S.items.length)return;S.i=i;renderList();const c=S.items[i];S.selectedId=c.id;document.querySelectorAll('.item')[i]?.scrollIntoView({block:'nearest'});
+ await api('POST','/api/view',{id:c.id});const full=await api('GET','/api/candidate?id='+encodeURIComponent(c.id));if(S.selectedId!==c.id)return;renderDetail(full);await refreshProductions(c.id)}
 function metricsTable(c){const rows=S.state.metric_fields.map(n=>{const m=c.metrics[n];return el('tr',{},el('td',{},n),el('td',{},m?String(m.value):UNK(null)),
  el('td',{class:'unk'},m?`${m.source} · ${(m.boards||[]).join(',')} · ${m.collected_at}`:'нет данных'))});return el('table',{},el('tr',{},el('th',{},'метрика'),el('th',{},'значение'),el('th',{},'происхождение, время сбора')),rows)}
 function player(c){const box=el('div',{class:'vid'});if(!c.video_url){box.append(el('div',{class:'nov'},'Видео недоступно: в записи источника нет ссылки на видео.',c.cover_url?el('img',{src:c.cover_url,referrerpolicy:'no-referrer',style:'max-width:100%;margin-top:8px'}):null));return box}
@@ -287,6 +421,15 @@ function analysisView(a){if(!a)return el('p',{class:'unk'},'Анализ не з
   el('h3',{},'Оценка механизма (гипотеза AI, не доказательство прибыльности)'),
   el('table',{},Object.entries(r.ratings).map(([k,v])=>el('tr',{},el('td',{},k),el('td',{},v===null?UNK(null):v+' / 5')))),
   r.warnings.length?el('div',{class:'warn'},'Предупреждения проверки: '+r.warnings.join('; ')):null)}
+async function refreshProductions(cid){const panel=$('productionPanel');if(!panel||S.selectedId!==cid)return;let data;try{data=await api('GET','/api/productions?id='+encodeURIComponent(cid))}catch(e){return}if(!$('productionPanel')||S.selectedId!==cid)return;
+ panel.replaceChildren(el('h3',{},'Производство: атомы → кадр → QA'));
+ if(!data.items?.length){panel.append(el('p',{class:'unk'},'Пока нет кадров производства. Источник должен быть в Shortlist и иметь успешный анализ.'));return}
+ for(const run of data.items){panel.append(el('div',{class:'box'},el('b',{},`${run.status} · ${run.offer_name||run.offer_id||'оффер'} · ${run.started_at||''}`),
+  el('div',{class:'unk'},`run: ${run.run_id} · analysis: ${run.analysis_id} · exit: ${run.exit_code??'н/д'}`),
+  run.images?.length?el('div',{class:'acts'},run.images.map(name=>el('img',{src:'/api/production-file?'+new URLSearchParams({run:run.run_id,name}),alt:name,loading:'lazy',style:'max-width:240px;max-height:420px;object-fit:contain;border:1px solid #aaa;margin:4px'}))):el('p',{class:'warn'},'Изображения не получены; откройте лог ниже.'),
+  run.verdicts?.length?el('div',{class:'unk'},'QA: '+run.verdicts.map(v=>`shot ${v.shot??'?'} ${v.overall||'unknown'} (${v.commercial_status||'status n/a'})`).join(' · ')):null,
+  run.stdout_tail?el('details',{},el('summary',{},'Лог запуска'),el('pre',{},run.stdout_tail)):null,
+  run.stderr_tail?el('pre',{class:'warn'},run.stderr_tail):null))}}
 function renderDetail(c){const sc=c.source_score,sk=c.source_check,op=c.operator,D=$('detail');
  const act=(label,fn,cls)=>el('button',{class:cls||'',on:{click:fn}},label);
  const decide=async(action,need)=>{let reason='';if(need){reason=prompt(need);if(reason===null)return;if(!reason.trim()){say('Причина обязательна',true);return}}
@@ -299,7 +442,8 @@ function renderDetail(c){const sc=c.source_score,sk=c.source_check,op=c.operator
    say(r.status==='OK'?'Анализ сохранён':`${r.status}: ${r.detail||''} ${r.how_to_fix||''}`,r.status!=='OK');const full=await api('GET','/api/candidate?id='+encodeURIComponent(c.id));renderDetail(full)},'primary'),
    act('В shortlist',()=>decide('shortlist','Почему отбираете это объявление?')),act('Пропустить',()=>decide('skip')),act('Исключить',()=>decide('exclude','Причина исключения:'),'danger'),
    c.source_url?act('Открыть оригинал',()=>window.open(c.source_url,'_blank','noopener')):el('span',{class:'unk'},'нет ссылки на оригинал'),
-   op.state?act('Вернуть в ленту',()=>decide('restore')):null),
+   op.state?act('Вернуть в ленту',()=>decide('restore')):null,
+   op.state==='shortlist'&&c.analyses?.some(a=>a.status==='OK'&&a.result)?act('Создать кадр',async()=>{if(!confirm('Будет вызван текущий Brain и генератор изображения для выбранного целевого оффера. Фото товара проверяется до вызовов. Продолжить?'))return;say('Передача анализа в атомы и производство кадра…');const r=await api('POST','/api/produce',{id:c.id});say(r.status==='OK'?`Производство завершено: ${r.images?.length||0} изображений. Вердикт см. ниже.`:`${r.status}: ${r.detail||r.stderr_tail||'подробности в панели результата'}`,r.status!=='OK');await refreshProductions(c.id)},'primary'):null),
   op.state?el('div',{class:'box'},`Решение оператора: ${op.state} · ${op.reason||'без причины'} · ${op.updated_at}`):null,
   el('h3',{},'Оценка источника (старый ранжировщик, только по данным источника)'),
   sc?el('table',{},['final_score','performance_score','commercial_score','funnel_fit_score','evidence_score','longevity_score','duration_fit_score','action'].map(k=>el('tr',{},el('td',{},k),el('td',{},UNK(sc[k]))))):el('p',{class:'unk'},'оценки нет (импорт без решения старого ранжировщика)'),
@@ -309,7 +453,8 @@ function renderDetail(c){const sc=c.source_score,sk=c.source_check,op=c.operator
   el('h3',{},'Метрики источника'),metricsTable(c),
   c.history.length>1?el('div',{class:'unk'},`снимков метрик в истории: ${c.history.length}`):null)),
   el('h3',{},'Анализ ролика (AI, по требованию)'),analysisView(c.analyses[0]),
-  c.analyses.length>1?el('div',{class:'unk'},`предыдущих попыток анализа: ${c.analyses.length-1}`):null)}
+  c.analyses.length>1?el('div',{class:'unk'},`предыдущих попыток анализа: ${c.analyses.length-1}`):null,
+  el('section',{id:'productionPanel',class:'box'},el('h3',{},'Производство: атомы → кадр → QA'),el('p',{class:'unk'},'Загрузка истории производства…')));refreshProductions(c.id)}
 $('btnFind').onclick=()=>{const s=S.state?.find;if(s&&s.state!=='READY'){say(`FIND ${s.state}: ${s.detail}. ${s.how_to_fix}`,true)}$('dlgFind').showModal()};
 $('dlgFind').addEventListener('close',async()=>{if($('dlgFind').returnValue!=='go')return;say('Поиск выполняется…');
  const r=await api('POST','/api/find',{country:$('fCountry').value,period:+$('fPeriod').value,max_requests:+$('fReq').value,max_ads:+$('fAds').value,keywords:$('fKw').value.split(',').map(x=>x.trim()).filter(Boolean)});

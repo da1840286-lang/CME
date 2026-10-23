@@ -435,9 +435,13 @@ class ModelSubstitutionTests(unittest.TestCase):
 class SmokeEndToEndTests(unittest.TestCase):
     """Brain, judge and image provider all faked at the transport/client level."""
 
-    def make_ctx(self, quota=False, tmp=None, judge_fail=False):
-        brain_atoms = {"atoms": [atom("scene_a", "A bright kitchen counter"), atom("prod_a", "Product in the foreground", kind="product"),
-                                 atom("claim_a", "Reusable and dishwasher safe", kind="claim", channel="qa", priority="SHOULD")]}
+    def make_ctx(self, quota=False, tmp=None, judge_fail=False, shots=1):
+        atom_rows = []
+        for shot in range(1, shots + 1):
+            atom_rows.extend([atom(f"scene_{shot}", "A bright kitchen counter", shot=shot),
+                              atom(f"prod_{shot}", "Product in the foreground", kind="product", shot=shot)])
+        atom_rows.append(atom("claim_a", "Reusable and dishwasher safe", kind="claim", channel="qa", priority="SHOULD"))
+        brain_atoms = {"atoms": atom_rows}
         def transport(method, url, headers, payload):
             content = payload["messages"][1]["content"]
             if isinstance(content, list):  # judge call (has an image)
@@ -474,6 +478,22 @@ class SmokeEndToEndTests(unittest.TestCase):
             calls = [json.loads(x) for x in (out / "calls.jsonl").read_text().splitlines()]
             self.assertEqual({c["status"] for c in calls}, {"ok"})
             self.assertEqual(len(calls), 3)  # brain, image, judge
+
+    def test_all_generates_requested_shots_sequentially_and_keeps_atom_binding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            code = smoke_main(["all", "--shots", "2", "--settings", self.settings(tmp), "--out", str(out),
+                               "--no-ocr-required"], self.make_ctx(tmp=tmp, shots=2))
+            self.assertEqual(code, 0)
+            self.assertTrue((out / "shots" / "shot_01_a01.png").is_file())
+            self.assertTrue((out / "shots" / "shot_02_a01.png").is_file())
+            manifest = json.loads((out / "atoms_manifest.json").read_text())
+            self.assertEqual(manifest["requested_shots"], 2)
+            state = json.loads((out / "state.json").read_text())
+            self.assertEqual(set(state["shots"]), {"1", "2"})
+            self.assertNotEqual(state["shots"]["1"]["run_id"], state["shots"]["2"]["run_id"])
+            calls = [json.loads(x) for x in (out / "calls.jsonl").read_text().splitlines()]
+            self.assertEqual(len(calls), 5)  # one Brain call, then image+Judge for each shot
 
     def test_brain_writes_manifest_and_modified_atoms_are_rejected(self):
         from cme.smoke import validate_atoms_manifest

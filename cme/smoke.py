@@ -218,11 +218,17 @@ def main(argv=None, ctx=None) -> int:
                     atom_provenance = "external_unbound"
             else:
                 validate_atoms_manifest(out / "atoms.json", out / "atoms_manifest.json", data, offer, shot=args.shot)
-            verdict = run_frame(args, offer, settings, catalog, vertical, log, args.run_id, ctx, out, data, atom_provenance)
-            if verdict == "UNVERIFIED":
-                return 6
-            if verdict in ("FAILED_QA", "NOT_DELIVERED"):
-                return 7
+            # `all` must honor the full Brain contract. Generate sequentially so each accepted frame
+            # becomes the visual reference for the next shot; stop rather than chain a failed/unverified frame.
+            shot_numbers = range(1, args.shots + 1) if args.command == "all" else (args.shot,)
+            for shot_number in shot_numbers:
+                args.shot = shot_number
+                frame_run_id = args.run_id if shot_number == 1 else f"{args.run_id}-s{shot_number:02d}"
+                verdict = run_frame(args, offer, settings, catalog, vertical, log, frame_run_id, ctx, out, data, atom_provenance)
+                if verdict == "UNVERIFIED":
+                    return 6
+                if verdict in ("FAILED_QA", "NOT_DELIVERED"):
+                    return 7
     except FileNotFoundError as e:
         print(f"Не найден файл: {e.filename}. Скопируйте settings.example.json в settings.json и поправьте его.")
         return 3
