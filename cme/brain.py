@@ -231,6 +231,8 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
                      "Every kind='claim' atom must copy one verified claim verbatim and use channel='qa'; it records offer truth, not pixels.",
                      "Never put kind='claim' atoms in channel='image'. If visible proof is needed, create a separate image atom of kind product/action/scene that describes an observable cue, such as a close-up of the zip closure visibly shut.",
                      "Do not treat abstract care or durability claims as visually verifiable from a generic still. Ask for a visible label only when the brief explicitly requires on-image text.",
+                     "Every kind='qa_check' atom must use channel='qa'; it is a verification criterion and must not be included in the image-generation prompt.",
+                     "For no-text QA, forbid added captions, text overlays, subtitles, UI, watermarks, and promotional, discount, price, or shipping claims. Allow native logos, brand lettering, and markings physically printed on the target product only when they are visible in the supplied target-product reference.",
                      "Never invent text, pseudo-lettering, logos, brand names or labels. Reproduce them only when present in supplied product assets or explicitly specified by the offer/brief.",
                      "Never use a forbidden claim.",
                      "Write every atom text in English, even when the input context is in another language. Translate the source statements; never copy non-English words into atoms."]}
@@ -249,6 +251,7 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
             "Use the current OfferCard as the sole authority for target-product facts and claims; an older contract's target_offer is context only and never overrides OfferCard.",
             "Transfer the problem/intervention/proof logic, not the source ad's exact scene, creator, brand, UI, props, wording, or composition. Respect source_specific_components, replacement_requirements, must_change, contraindications, and limits.",
             "For each requested shot, keep the target-native action, proof, state_before/state_after, and result/delta where present. Express required visual directions as stable MUST atoms; do not silently omit them.",
+            "When a MUST image atom depicts an intervention result or before/after delta, define a visibly checkable contrast in the same frame: the original problem remains visible on the untreated side, the intervention tool/action sits at the boundary, and the treated side clearly shows the intended result. Avoid relying only on phrases like 'completely clean' without describing the visible boundary and changed area.",
             "The source's commercial metrics or reasoning-confidence values are not proof that the mechanism is profitable for the target offer.",
         ])
     if failed:

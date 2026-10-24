@@ -1,6 +1,7 @@
 import json, tempfile, unittest
 from pathlib import Path
 from cme.atoms import ATOM_SCHEMA, MAX_TEXT, check_claims, parse_atoms
+from cme.brain import build_request
 from cme.compiler import BudgetError, compile_image_prompt, compile_motion_prompt
 from cme.offer import OfferError, load_offer
 from tests.helpers import A
@@ -66,6 +67,32 @@ class AtomTests(unittest.TestCase):
         claim = parse_atoms([self.good(kind="claim", text="Reusable and dishwasher safe")]).atoms
         errors = check_claims(claim, o)
         self.assertIn("CLAIM_CHANNEL", errors["a_1"][0])
+
+    def test_qa_check_must_live_in_qa_channel_not_image_prompt(self):
+        bad = parse_atoms([self.good(kind="qa_check", text="No added text", channel="image")])
+        self.assertEqual(bad.atoms, [])
+        self.assertIn("QA_CHECK_CHANNEL", bad.errors["a_1"][0])
+
+        qa_atom = self.good(id="qa_no_text", kind="qa_check", text="No added overlays", channel="qa")
+        parsed = parse_atoms([self.good(), qa_atom])
+        self.assertEqual(parsed.errors, {})
+        self.assertEqual(compile_image_prompt(parsed.atoms, 1).text, "A kitchen counter")
+
+    def test_brain_qa_rules_allow_reference_native_branding(self):
+        request = build_request(load_offer(EX), "brief", 1)
+        rules = " ".join(request["rules"])
+        self.assertIn("kind='qa_check'", rules)
+        self.assertIn("channel='qa'", rules)
+        self.assertIn("native logos", rules)
+        self.assertIn("supplied target-product reference", rules)
+
+    def test_source_transfer_result_atoms_require_a_visible_before_after_boundary(self):
+        request = build_request(load_offer(EX), "brief", 1,
+                                source_transfer={"mechanism_hypothesis": "show removal of the problem"})
+        rules = " ".join(request["rules"])
+        self.assertIn("untreated side", rules)
+        self.assertIn("at the boundary", rules)
+        self.assertIn("treated side", rules)
 
 
 class CompilerTests(unittest.TestCase):

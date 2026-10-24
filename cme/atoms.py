@@ -90,6 +90,8 @@ def parse_atoms(raw) -> ParseResult:
                 errs.append("id must match [a-z0-9_]{2,40}")
             if item["kind"] not in KINDS:
                 errs.append(f"kind must be one of {', '.join(KINDS)}: product claims must use kind 'claim'")
+            if item["kind"] == "qa_check" and item["channel"] != "qa":
+                errs.append("QA_CHECK_CHANNEL: kind='qa_check' must use channel 'qa'; verification criteria must not be image-prompt text")
             if item["priority"] not in PRIORITIES:
                 errs.append(f"bad priority {item['priority']}")
             if item["channel"] not in CHANNELS:
