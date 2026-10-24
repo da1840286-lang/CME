@@ -132,9 +132,12 @@ def _embedded_all_stage_script():
         run = step.get("run") or ""
         if "run_source_loop" not in run:
             continue
-        marker = "<<'PY'\\n"
-        start = run.rindex(marker, 0, run.rindex("run_source_loop")) + len(marker)
-        end = run.index("\\nPY\\n", start)
+        loop_pos = run.rindex("run_source_loop")
+        marker_pos = run.rfind("<<'PY'", 0, loop_pos)
+        if marker_pos < 0:
+            raise AssertionError("could not locate the Python heredoc containing run_source_loop")
+        start = run.index("\\n", marker_pos) + 1
+        end = run.index("\\nPY", loop_pos)
         return run[start:end] + "\\n"
     raise AssertionError("workflow does not run the testable source loop")
 
