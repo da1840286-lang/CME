@@ -133,7 +133,7 @@ def _embedded_all_stage_script():
         if "run_source_loop" not in run:
             continue
         marker = "<<'PY'\\n"
-        start = run.rindex(marker, 0, run.index("run_source_loop")) + len(marker)
+        start = run.rindex(marker, 0, run.rindex("run_source_loop")) + len(marker)
         end = run.index("\\nPY\\n", start)
         return run[start:end] + "\\n"
     raise AssertionError("workflow does not run the testable source loop")
