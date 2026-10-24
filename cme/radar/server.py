@@ -255,6 +255,14 @@ class RadarApp:
             calls_path = out / "calls.jsonl"
             if calls_path.is_file():
                 report["provider_calls_made"] = sum(1 for line in calls_path.read_text(encoding="utf-8").splitlines() if line.strip())
+            run_result_path = out / "run_result.json"
+            if run_result_path.is_file():
+                try:
+                    run_result = json.loads(run_result_path.read_text(encoding="utf-8"))
+                    report["failure_class"] = str(run_result.get("failure_class") or "")
+                    report["failure_detail"] = str(run_result.get("message") or "")[:1000]
+                except (OSError, ValueError):
+                    report["failure_class"] = "RUN_RESULT_UNREADABLE"
             report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         return report

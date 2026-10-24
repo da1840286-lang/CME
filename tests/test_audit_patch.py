@@ -25,6 +25,12 @@ def atom(i, text="A clean kitchen counter", shot=1, kind="scene", prio="MUST", c
     return {"id": i, "kind": kind, "text": text, "priority": prio, "channel": ch, "shot": shot}
 
 
+def transfer_decision(atom_id="mech_problem_seat"):
+    return {"transferable": True, "abstract_mechanism": "Show a clear problem and visible improvement",
+            "preserved": [{"property": "the source problem becomes a visibly improved result", "atom_id": atom_id}],
+            "reason": "The target product can honestly demonstrate the same causal mechanism."}
+
+
 RADAR = {"result": {
     "hook": {"text": "Visible mess", "kind": "OBSERVED"},
     "buyer_problem": {"text": "Crumbs trapped between car seats", "kind": "OBSERVED"},
@@ -127,7 +133,8 @@ class MechanismCoverageTests(unittest.TestCase):
 
         def call(req):
             calls.append(req)
-            return {"atoms": FULL[:1] + [atom("s1_scene")]} if len(calls) == 1 else {"atoms": FULL[1:]}
+            return ({"atoms": FULL[:1] + [atom("s1_scene")], "transfer_decision": transfer_decision()}
+                    if len(calls) == 1 else {"atoms": FULL[1:], "transfer_decision": transfer_decision()})
         atoms = request_atoms(offer, "b", 1, call, source_transfer=ctx)
         self.assertEqual(missing_mechanism_links(atoms, ["problem", "intervention", "result"]), [])
         fix_ids = {f["id"] for f in calls[1]["only_fix"]}
@@ -153,7 +160,7 @@ class MechanismCoverageTests(unittest.TestCase):
             (root / "src.json").write_text(json.dumps(RADAR), encoding="utf-8")
 
             def transport(method, url, headers, payload):
-                body = {"model": payload["model"], "choices": [{"message": {"content": json.dumps({"atoms": FULL})}}]}
+                body = {"model": payload["model"], "choices": [{"message": {"content": json.dumps({"atoms": FULL, "transfer_decision": transfer_decision()})}}]}
                 return 200, json.dumps(body).encode()
             out = root / "out"
             code = smoke_main(["brain", "--settings", str(root / "settings.json"), "--out", str(out),
