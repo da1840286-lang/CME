@@ -888,6 +888,9 @@ jobs:
                   failure_class = "DELIVERED_PASS"
               elif report.get("failure_class") == "TRANSFER_REJECTED":
                   failure_class = "TRANSFER_REJECTED"
+              elif report.get("failure_class"):
+                  # Keep provider, contract and QA failure classes from run_result.json intact.
+                  failure_class = str(report.get("failure_class"))
               elif "UNVERIFIED" in verdict_text or status_text == "UNVERIFIED":
                   failure_class = "QA_UNVERIFIED"
               elif "NOT_DELIVERED" in verdict_text or status_text == "NOT_DELIVERED":

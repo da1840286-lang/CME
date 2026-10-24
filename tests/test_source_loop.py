@@ -119,3 +119,129 @@ class SourceLoopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+# Exercise the embedded Actions script with a fake RadarApp. No provider calls are made.
+def _embedded_all_stage_script():
+    import yaml
+    workflow_path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "live-smoke.yml"
+    document = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    for step in document["jobs"]["smoke"]["steps"]:
+        run = step.get("run") or ""
+        if "run_source_loop" not in run:
+            continue
+        marker = "<<'PY'\\n"
+        start = run.rindex(marker, 0, run.index("run_source_loop")) + len(marker)
+        end = run.index("\\nPY\\n", start)
+        return run[start:end] + "\\n"
+    raise AssertionError("workflow does not run the testable source loop")
+
+
+_FAKE_RADAR_APP = r'''
+import json, sys
+from pathlib import Path
+import cme.radar.server as server
+PLAN = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+class Store:
+    def ingest(self, items, source, state): pass
+    def decide(self, cid, state, reason): pass
+    def analyses(self, cid): return [{"result": {"mechanism_hypothesis": {"text": "source mechanism"}}}]
+    def close(self): pass
+
+class FakeApp:
+    def __init__(self, work, **kwargs):
+        self.work = Path(work)
+        self.store = Store()
+        self.calls = 0
+    def do_analyze(self, cid):
+        return {"status": PLAN.get("analysis", {}).get(cid, "OK"), "analysis_id": 1}
+    def do_produce(self, cid):
+        self.calls += 1
+        spec = PLAN["produce"][cid]
+        run_id = f"prod-test-{self.calls}"
+        folder = self.work / "production" / run_id
+        folder.mkdir(parents=True)
+        (folder / "run_result.json").write_text(json.dumps({"failure_class": spec["failure_class"]}), encoding="utf-8")
+        return {"run_id": run_id, "status": spec["status"], "exit_code": spec["exit_code"],
+                "failure_class": spec["failure_class"], "failure_detail": spec.get("detail", ""),
+                "images": [], "verdicts": [{"overall": spec.get("verdict", "")}],
+                "offer_name": "Target", "provider_calls_made": 0}
+server.RadarApp = FakeApp
+exec(compile(Path(sys.argv[2]).read_text(encoding="utf-8"), "workflow", "exec"), {"__name__": "__main__"})
+'''
+
+
+def _candidate(candidate_id, score):
+    return {"id": candidate_id, "title": f"title {candidate_id}", "brand": "brand",
+            "video_url": "https://video.example/source.mp4",
+            "source_check": {"classification": "DIRECT"},
+            "source_score": {"final_score": score, "action": "DEEP",
+                             "components": {"money_signal_gate": {"pass": True}}}}
+
+
+class WorkflowFallbackIntegrationTests(unittest.TestCase):
+    OK = {"status": "OK", "exit_code": 0, "failure_class": "DELIVERED_PASS"}
+    REJECT = {"status": "ATOM_CONTRACT_FAILED", "exit_code": 4, "failure_class": "TRANSFER_REJECTED",
+              "detail": "source mechanism cannot be shown by target product"}
+
+    def run_workflow(self, plan, candidate_id="", ids=("a", "b", "c")):
+        import os
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "out").mkdir()
+            candidates = {"candidates": [_candidate(cid, 70-i) for i, cid in enumerate(ids)]}
+            (root / "out" / "candidates.json").write_text(json.dumps(candidates), encoding="utf-8")
+            (root / "find-input").mkdir()
+            (root / "find-input" / "candidates.json").write_text(json.dumps(candidates), encoding="utf-8")
+            (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            (root / "workflow.py").write_text(_embedded_all_stage_script(), encoding="utf-8")
+            (root / "runner.py").write_text(_FAKE_RADAR_APP, encoding="utf-8")
+            (root / "summary.md").write_text("", encoding="utf-8")
+            env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+                   "CANDIDATE_ID": candidate_id, "FIND_RUN_ID": "", "SHOTS": "1",
+                   "GITHUB_STEP_SUMMARY": str(root / "summary.md"), "GITHUB_RUN_ID": "test"}
+            completed = subprocess.run([sys.executable, "runner.py", "plan.json", "workflow.py"],
+                                       cwd=root, env=env, capture_output=True, text=True, timeout=60)
+            result_path = root / "out" / "live_result.json"
+            live = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
+            attempt_path = root / "out" / "source_analysis_attempts.json"
+            attempts = json.loads(attempt_path.read_text(encoding="utf-8")) if attempt_path.exists() else {}
+            return completed, live, attempts
+
+    def test_first_transfer_rejection_uses_next_ranked_candidate(self):
+        completed, live, attempts = self.run_workflow({
+            "analysis": {}, "produce": {"a": self.REJECT, "b": self.OK, "c": self.OK}})
+        self.assertEqual(completed.returncode, 0, completed.stderr[-1000:])
+        self.assertEqual(live["candidate_id"], "b")
+        self.assertEqual(live["failure_class"], "DELIVERED_PASS")
+        self.assertEqual([row["candidate_id"] for row in live["transfer_rejections"]], ["a"])
+        self.assertEqual(attempts["selected_candidate_id"], "b")
+
+    def test_all_rejected_returns_transfer_rejected_not_a_fake_pass(self):
+        completed, live, _ = self.run_workflow({
+            "analysis": {}, "produce": {"a": self.REJECT, "b": self.REJECT, "c": self.REJECT}})
+        self.assertEqual(completed.returncode, 4)
+        self.assertEqual(live["failure_class"], "TRANSFER_REJECTED")
+        self.assertEqual(len(live["transfer_rejections"]), 3)
+
+    def test_manual_candidate_is_never_replaced(self):
+        completed, live, attempts = self.run_workflow(
+            {"analysis": {}, "produce": {"a": self.REJECT, "b": self.OK}}, candidate_id="a")
+        self.assertEqual(completed.returncode, 4)
+        self.assertEqual(live["candidate_id"], "a")
+        self.assertEqual([row["candidate_id"] for row in attempts["attempts"]], ["a"])
+        self.assertEqual(attempts["max_candidates"], 1)
+
+    def test_provider_error_is_preserved_and_does_not_trigger_transfer_fallback(self):
+        provider = {"status": "INFRA_ERROR", "exit_code": 2, "failure_class": "INFRASTRUCTURE_ERROR",
+                    "verdict": "FAILED_QA"}
+        completed, live, _ = self.run_workflow({"analysis": {}, "produce": {"a": provider, "b": self.OK}})
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(live["candidate_id"], "a")
+        self.assertEqual(live["failure_class"], "INFRASTRUCTURE_ERROR")
