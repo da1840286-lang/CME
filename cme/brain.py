@@ -235,6 +235,7 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
                      "For no-text QA, forbid added captions, text overlays, subtitles, UI, watermarks, and promotional, discount, price, or shipping claims. Allow native logos, brand lettering, and markings physically printed on the target product only when they are visible in the supplied target-product reference.",
                      "Never invent text, pseudo-lettering, logos, brand names or labels. Reproduce them only when present in supplied product assets or explicitly specified by the offer/brief.",
                      "Never use a forbidden claim.",
+                     "When target-product reference photos are supplied, preserve the actual target product's form factor, silhouette, proportions, and distinctive visible parts. Keep the target product body recognizable in the frame; do not substitute a generic lookalike or change a compact handheld product into an upright/stick device.",
                      "Write every atom text in English, even when the input context is in another language. Translate the source statements; never copy non-English words into atoms."]}
     if source_transfer:
         req["source_transfer"] = source_transfer
@@ -248,10 +249,11 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
                 "scene, with visible, checkable content. Do not copy the source product, brand, creator or setting.")
         req["rules"].extend([
             "When source_transfer is supplied, preserve its causal mechanism and target-native rebuild sequence as structured atom requirements.",
-            "Use the current OfferCard as the sole authority for target-product facts and claims; an older contract's target_offer is context only and never overrides OfferCard.",
+            "The current OfferCard and supplied target-product photos are the ONLY authority for target-product facts. Source-transfer context is authority only for the causal mechanism, not target hardware or specifications. Never copy source-only attachments, tools, features, colors, construction, or product form into target atoms unless visible in target-product references or explicitly confirmed by OfferCard/brief. When no target-native feature is verified, retain the generic target product shown in the reference and transfer the demo logic only.",
             "Transfer the problem/intervention/proof logic, not the source ad's exact scene, creator, brand, UI, props, wording, or composition. Respect source_specific_components, replacement_requirements, must_change, contraindications, and limits.",
             "For each requested shot, keep the target-native action, proof, state_before/state_after, and result/delta where present. Express required visual directions as stable MUST atoms; do not silently omit them.",
-            "When a MUST image atom depicts an intervention result or before/after delta, define a visibly checkable contrast in the same frame: the original problem remains visible on the untreated side, the intervention tool/action sits at the boundary, and the treated side clearly shows the intended result. Avoid relying only on phrases like 'completely clean' without describing the visible boundary and changed area.",
+            "Do not pack several unverified accessories into one MUST atom. Keep the main target product body visible and show only the attachment performing the action; omit accessories not visible in the target reference or confirmed by OfferCard/brief.",
+            "When a MUST image atom depicts an intervention result or before/after delta, define a visibly checkable contrast in the same frame: specify where the untreated/dirty side and treated/clean side are located (for example, left/right); keep the intervention tool/action at their visible boundary; make the cleaned result a substantial, unobstructed debris-free strip that is not hidden under the tool. Avoid relying only on phrases like 'completely clean' without describing the visible boundary and changed area.",
             "The source's commercial metrics or reasoning-confidence values are not proof that the mechanism is profitable for the target offer.",
         ])
     if failed:

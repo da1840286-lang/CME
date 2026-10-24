@@ -86,13 +86,33 @@ class AtomTests(unittest.TestCase):
         self.assertIn("native logos", rules)
         self.assertIn("supplied target-product reference", rules)
 
+    def test_target_product_form_factor_is_preserved(self):
+        request = build_request(load_offer(EX), "brief", 1)
+        rules = " ".join(request["rules"])
+        self.assertIn("form factor, silhouette, proportions", rules)
+        self.assertIn("Keep the target product body recognizable", rules)
+
+    def test_source_only_hardware_does_not_transfer_to_target_product(self):
+        request = build_request(load_offer(EX), "brief", 1, source_transfer={
+            "format": "radar_analysis_hypothesis",
+            "buyer_problem": "Dust is hard to see in dark corners",
+            "product_intervention": "Source vacuum has a motorized brush, hose, and green LED",
+            "result_demo": "Green LED reveals dirt beside a wall",
+        })
+        rules = " ".join(request["rules"])
+        self.assertIn("Source-transfer context is authority only for the causal mechanism", rules)
+        self.assertIn("Never copy source-only attachments, tools, features", rules)
+        self.assertIn("confirmed by OfferCard/brief", rules)
+        self.assertIn("omit accessories not visible", rules)
+
     def test_source_transfer_result_atoms_require_a_visible_before_after_boundary(self):
         request = build_request(load_offer(EX), "brief", 1,
                                 source_transfer={"mechanism_hypothesis": "show removal of the problem"})
         rules = " ".join(request["rules"])
-        self.assertIn("untreated side", rules)
-        self.assertIn("at the boundary", rules)
-        self.assertIn("treated side", rules)
+        self.assertIn("untreated/dirty side", rules)
+        self.assertIn("treated/clean side", rules)
+        self.assertIn("at their visible boundary", rules)
+        self.assertIn("substantial, unobstructed debris-free strip", rules)
 
 
 class CompilerTests(unittest.TestCase):
