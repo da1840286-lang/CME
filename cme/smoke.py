@@ -94,6 +94,21 @@ def atoms_summary(atoms) -> str:
     return "\n".join(f"  shot {s} / {c}: " + ", ".join(f"{k}={v}" for k, v in d.items()) for (s, c), d in sorted(rows.items()))
 
 
+def image_seed_for_attempt(base_seed: int, attempt: int, contract_id: str) -> int:
+    """Use a reproducible per-contract seed, then advance it for each retry of that contract."""
+    if type(base_seed) is not int:
+        raise SettingsError("image adapter seed must be an integer")
+    if type(attempt) is not int or attempt < 1:
+        raise SettingsError("frame attempt must be a positive integer")
+    suffix = str(contract_id).rsplit("-", 1)[-1]
+    try:
+        contract_offset = int(suffix[-8:], 16) % 1_000_000
+    except ValueError as exc:
+        raise SettingsError("frame contract_id must end with a hexadecimal digest") from exc
+    # Add one so a new contract never reuses the old catalog seed by default.
+    return base_seed + contract_offset + 1 + attempt - 1
+
+
 def run_brain(args, offer, settings, catalog, vertical, log, run_id, ctx, out):
     atoms_path, manifest_path = out / "atoms.json", out / "atoms_manifest.json"
     source_transfer = None
@@ -155,7 +170,12 @@ def run_frame(args, offer, settings, catalog, vertical, log, run_id, ctx, out, a
         reference_issues = validate_product_references(offer.photos)
         if reference_issues:
             raise OfferError("Product-photo preflight blocked generation: " + "; ".join(reference_issues))
-    provider = make_image_provider(settings, catalog, log, run_id, **ctx)
+    image_seed = None
+    image_spec = catalog.get(settings.image_adapter)
+    if image_spec and image_spec.kind == "image" and image_spec.provider == "hf_space":
+        # A retry is a new, reproducible candidate, not the same fixed-seed image again.
+        image_seed = image_seed_for_attempt(image_spec.params.get("seed", 0), args.attempt, contract_id)
+    provider = make_image_provider(settings, catalog, log, run_id, image_seed=image_seed, **ctx)
     judge = make_judge(settings, catalog, log, run_id, **ctx) if settings.judge_adapter else None
     qa = make_qa_checks(atoms, args.shot, judge_fn=judge, ocr_required=not args.no_ocr_required,
                         verified_claims=offer.verified_claims, product_references=offer.photos)

@@ -19,7 +19,8 @@ class SettingsError(ValueError):
 
 FACTORIES = {
     ("hf_space", "image"): lambda params, **ctx: make_hf_space_image(
-        params, token=ctx.get("hf_token") or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN"),
+        {**params, **({"seed": ctx["image_seed"]} if ctx.get("image_seed") is not None else {})},
+        token=ctx.get("hf_token") or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN"),
         client_factory=ctx.get("client_factory")),
     ("fal", "image"): lambda params, **ctx: make_fal_image(params, api_key=ctx.get("fal_key"), transport=ctx.get("transport")),
     ("openrouter", "brain"): lambda params, **ctx: make_openrouter_brain(
@@ -111,9 +112,12 @@ def build_adapter(spec: AdapterSpec, allow_free: bool = False, allow_unverified:
     return factory({**spec.params, "model_id": spec.model_id}, **ctx)
 
 
-def _info(spec, primary):
-    return {"adapter": spec.name, "tier": spec.tier, "model_id": spec.model_id, "provider": spec.provider,
+def _info(spec, primary, image_seed=None):
+    info = {"adapter": spec.name, "tier": spec.tier, "model_id": spec.model_id, "provider": spec.provider,
             "verified": spec.verified, "fallback_used": spec.name != primary.name}
+    if spec.kind == "image" and spec.provider == "hf_space" and image_seed is not None:
+        info["seed"] = image_seed
+    return info
 
 
 def make_image_provider(settings: Settings, catalog: dict, log: CallLog, run_id: str, **ctx):
@@ -124,20 +128,21 @@ def make_image_provider(settings: Settings, catalog: dict, log: CallLog, run_id:
         raise ProviderPolicyError(f"unknown fallback_adapter {settings.fallback_adapter!r} in settings.json")
     primary = catalog[settings.image_adapter]
     fb = catalog[settings.fallback_adapter] if settings.fallback_adapter else None
+    image_seed = ctx.get("image_seed")
     specs = {primary.ref: primary, **({fb.ref: fb} if fb else {})}
     fns = {s.name: build_adapter(s, settings.allow_free, settings.allow_unverified, **ctx) for s in specs.values()}
 
     def provider(prompt: str, refs) -> bytes:
         def go(ref):
             spec = specs[ref]
-            provider.info = _info(spec, primary) | {"call_status": "STARTED"}
+            provider.info = _info(spec, primary, image_seed) | {"call_status": "STARTED"}
             try:
                 data = fns[spec.name](prompt, refs)
             except Exception as e:
-                provider.info = _info(spec, primary) | {"call_status": "ERROR",
+                provider.info = _info(spec, primary, image_seed) | {"call_status": "ERROR",
                     "error_type": type(e).__name__, "error": str(e)[:300]}
                 raise
-            provider.info = _info(spec, primary) | {"call_status": "OK"}
+            provider.info = _info(spec, primary, image_seed) | {"call_status": "OK"}
             return data, {}  # image services do not report which model ran: logged as 'unreported'
         return call_with_policy(primary.ref, go, log, run_id, fb.ref if fb else None, settings.allow_free)
 

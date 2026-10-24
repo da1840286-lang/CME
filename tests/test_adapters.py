@@ -8,6 +8,7 @@ from cme.providers import (CallLog, InfraError, ModelRef, ProviderCallError, Pro
 from cme.qa import file_check
 from cme.registry import AdapterSpec, Settings, build_adapter, describe, load_catalog, make_image_provider
 from cme.run import produce_shot
+from cme.smoke import image_seed_for_attempt
 from cme.state import new_run
 from tests.helpers import A, png_bytes
 from cme.offer import load_offer
@@ -106,6 +107,40 @@ class HFAdapterTests(unittest.TestCase):
     def test_no_file_in_result(self):
         with self.assertRaises(ProviderCallError):
             extract_image_path({"nothing": 1})
+
+    def test_attempt_seed_varies_by_contract_and_attempt_reproducibly(self):
+        first = image_seed_for_attempt(0, 1, "contract-123456789abcdef0")
+        retry = image_seed_for_attempt(0, 2, "contract-123456789abcdef0")
+        other_contract = image_seed_for_attempt(0, 1, "contract-abcdef0123456789")
+        self.assertGreater(first, 0)
+        self.assertEqual(retry, first + 1)
+        self.assertNotEqual(first, other_contract)
+        self.assertEqual(first, image_seed_for_attempt(0, 1, "contract-123456789abcdef0"))
+        with self.assertRaises(ValueError):
+            image_seed_for_attempt(0, 0, "contract-123456789abcdef0")
+        with self.assertRaises(ValueError):
+            image_seed_for_attempt(True, 2, "contract-123456789abcdef0")
+        with self.assertRaises(ValueError):
+            image_seed_for_attempt(0, 1, "not-a-contract")
+
+    def test_seed_override_reaches_hf_and_is_written_to_provider_metadata(self):
+        with tempfile.TemporaryDirectory() as d:
+            img = Path(d) / "out.png"
+            img.write_bytes(PNG)
+            seen = {}
+            def predict(a, api):
+                seen["args"], seen["api"] = a, api
+                return str(img)
+            spec = AdapterSpec("hf", "image", "hf_space", "s/x", "free", self.PARAMS, verified=True)
+            provider = make_image_provider(
+                Settings(image_adapter="hf", allow_free=True), {"hf": spec},
+                CallLog(Path(d) / "calls.jsonl"), "seed-test",
+                client_factory=self.fake_factory(predict), image_seed=18)
+            provider("prompt", ["ref.png"])
+            self.assertEqual(seen["args"][2], 18)
+            self.assertEqual(seen["api"], "/gen")
+            self.assertEqual(provider.info["seed"], 18)
+            self.assertEqual(provider.info["call_status"], "OK")
 
 
 class FalAdapterTests(unittest.TestCase):
