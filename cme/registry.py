@@ -11,7 +11,7 @@ from pathlib import Path
 from .adapters.fal_http import make_fal_image
 from .adapters.hf_space import make_hf_space_image
 from .adapters.openrouter import make_openrouter_analyst, make_openrouter_brain, make_openrouter_judge
-from .providers import CallLog, ModelRef, ProviderPolicyError, call_with_policy, check_model
+from .providers import CallLog, InfraError, ModelRef, ProviderPolicyError, call_with_policy, check_model
 
 class SettingsError(ValueError):
     pass
@@ -165,7 +165,18 @@ def _make_llm(adapter_name, kind, settings, catalog, log, run_id, **ctx):
             out, meta = fn(*args)
             run.info = _info(spec, spec) | {"responded_model": meta.get("model")}
             return out, meta
-        return call_with_policy(spec.ref, go, log, run_id, allow_free=settings.allow_free)
+        # QA Judge only: retry one transient infrastructure failure on the same explicit model.
+        # Never retry malformed/negative verdicts, policy errors, or non-transient provider errors.
+        attempts = 2 if kind == "judge" else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return call_with_policy(spec.ref, go, log, run_id, allow_free=settings.allow_free)
+            except InfraError as e:
+                log.write(run_id=run_id, component="qa_judge_resilience", attempt=attempt,
+                          max_attempts=attempts, status="retry" if attempt < attempts else "exhausted",
+                          error=str(e)[:300])
+                if attempt == attempts:
+                    raise
 
     run.info = {}
     return run
