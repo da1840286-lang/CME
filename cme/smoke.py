@@ -14,9 +14,9 @@ import sys
 import time
 from pathlib import Path
 from .atoms import check_claims, check_language, parse_atoms
-from .brain import (BrainError, TransferRejected, build_source_transfer_context, derive_mechanism_links,
-                    missing_mechanism_links, reserved_system_atom_errors, validate_transfer_decision,
-                    visual_structure_errors, request_atoms)
+from .brain import (BrainError, TransferRejected, atom_budget_errors, build_source_transfer_context,
+                    derive_mechanism_links, missing_mechanism_links, reserved_system_atom_errors,
+                    validate_transfer_decision, visual_structure_errors, request_atoms)
 from .compiler import BudgetError
 from .offer import OfferError, load_offer
 from .providers import CallLog, InfraError, ProviderCallError, ProviderPolicyError
@@ -99,6 +99,7 @@ def validate_atoms_manifest(atoms_path, manifest_path, atoms_json, offer, shot=N
     errors.update(reserved_system_atom_errors(atoms_json))
     if type(requested) is int and requested >= 1:
         errors.update(visual_structure_errors(atoms_json, requested, links))
+        errors.update(atom_budget_errors(atoms_json, requested))
     if errors:
         raise BrainError(errors)
     return manifest

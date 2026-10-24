@@ -268,6 +268,81 @@ def visual_structure_errors(atoms, shots: int, links) -> dict:
     return errors
 
 
+
+# Frame budget protects the image prompt from contradictory/redundant MUST requirements.
+MAX_MUST_IMAGE_PER_SHOT = 6
+REDUNDANCY_OVERLAP = 0.75
+_STOPWORDS = frozenset("a an the of on in at to and or with without from into onto by for as is are be its it "
+                       "this that then than same visible clearly showing show shown image frame scene product target "
+                       "source shot must should may and".split())
+
+
+def _content_tokens(text) -> frozenset:
+    tokens = set()
+    for token in re.findall(r"[a-z0-9]+", str(text or "").lower()):
+        if token in _STOPWORDS or len(token) < 2:
+            continue
+        if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+            token = token[:-1]
+        tokens.add(token)
+    return frozenset(tokens)
+
+
+def _budget_row(atom) -> dict:
+    get = atom.get if isinstance(atom, dict) else (lambda key, default=None: getattr(atom, key, default))
+    return {"id": str(get("id") or ""), "kind": get("kind"), "priority": get("priority"),
+            "channel": get("channel"), "shot": get("shot"), "text": str(get("text") or "")}
+
+
+def atom_budget_errors(atoms, shots: int) -> dict:
+    """Return per-atom fixes and frame-level conflicts for redundant or over-budget MUST atoms."""
+    rows = [_budget_row(a) for a in atoms]
+    errors = {}
+    for shot in range(1, int(shots) + 1):
+        must = [r for r in rows if r["shot"] == shot and r["channel"] == "image" and r["priority"] == "MUST"]
+
+        def protected(row):
+            return row["id"].startswith(("mech_", "comp_"))
+
+        layout = [r for r in must if r["kind"] == "composition" or r["id"].startswith(("comp_", "composition"))]
+        layout.sort(key=lambda r: (not r["id"].startswith("comp_"), not r["id"].startswith("mech_")))
+        for extra in layout[1:]:
+            if not protected(extra):
+                errors[extra["id"]] = [
+                    f"FRAME_LAYOUT_CONFLICT: shot {shot} already has layout atom '{layout[0]['id']}'; one frame gets ONE "
+                    f"layout. Merge this into it or re-send '{extra['id']}' with priority='SHOULD'."
+                ]
+
+        kept = []
+        ordered = sorted((r for r in must if r["id"] not in errors), key=lambda r: not r["id"].startswith("mech_"))
+        for row in ordered:
+            tokens = _content_tokens(row["text"])
+            duplicate, best = None, 0.0
+            if len(tokens) >= 4:
+                for old, old_tokens in kept:
+                    if len(old_tokens) < 4:
+                        continue
+                    score = len(tokens & old_tokens) / min(len(tokens), len(old_tokens))
+                    if score >= REDUNDANCY_OVERLAP and score > best:
+                        duplicate, best = old["id"], score
+            if duplicate is not None and not protected(row):
+                errors[row["id"]] = [
+                    f"FRAME_REDUNDANT: '{row['id']}' repeats requirement '{duplicate}' in shot {shot}. "
+                    "Re-send it with priority='SHOULD' or describe a different visible requirement."
+                ]
+            else:
+                kept.append((row, tokens))
+
+        remaining = [r for r in must if r["id"] not in errors]
+        if len(remaining) > MAX_MUST_IMAGE_PER_SHOT:
+            errors[f"#must_budget_{shot}"] = [
+                f"FRAME_BUDGET: shot {shot} has {len(remaining)} MUST image atoms "
+                f"(limit {MAX_MUST_IMAGE_PER_SHOT}). Re-send the least essential ones with priority='SHOULD'; "
+                "keep the mechanism and target-product requirements."
+            ]
+    return errors
+
+
 class TransferRejected(BrainError):
     """The source mechanism cannot be shown honestly with the selected target product."""
 
@@ -332,7 +407,8 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
                      "Never invent text, pseudo-lettering, logos, brand names or labels. Reproduce them only when present in supplied product assets or explicitly specified by the offer/brief.",
                      "Never use a forbidden claim.",
                      "When target-product reference photos are supplied, preserve the actual target product's form factor, silhouette, proportions, and distinctive visible parts. Keep the target product body recognizable in the frame; do not substitute a generic lookalike or change a compact handheld product into an upright/stick device.",
-                     "Write every atom text in English, even when the input context is in another language. Translate the source statements; never copy non-English words into atoms."]}
+                     "Write every atom text in English, even when the input context is in another language. Translate the source statements; never copy non-English words into atoms.",
+                     "Frame budget: at most %d MUST image atoms per shot; use only one layout atom per shot; do not repeat the same visible requirement in a scene, action and mechanism atom. The mech_* atom carries the idea; other atoms add only distinct requirements." % MAX_MUST_IMAGE_PER_SHOT]}
     if source_transfer:
         req["source_transfer"] = source_transfer
         links = derive_mechanism_links(source_transfer)
@@ -419,14 +495,16 @@ def request_atoms(offer, brief: str, shots: int, call, max_retries: int = 2, ver
                 pending[f"#shot_{k}"] = [f"shot {k} has no MUST image atom"]
         for name in missing_mechanism_links(by_id.values(), required_links):
             pending[f"#mechanism_{name}"] = [f"mechanism link '{name}' has no MUST image atom with id prefix mech_{name}_"]
-        structure_errors = visual_structure_errors(by_id.values(), shots, required_links)
+        structure_errors = {**visual_structure_errors(by_id.values(), shots, required_links),
+                            **atom_budget_errors(by_id.values(), shots)}
         pending.update(structure_errors)
         for aid in list(structure_errors):
             if not aid.startswith("#"):
                 by_id.pop(aid, None)
         for name in missing_mechanism_links(by_id.values(), required_links):
             pending[f"#mechanism_{name}"] = [f"mechanism link '{name}' has no MUST image atom with id prefix mech_{name}_"]
-        structure_errors = visual_structure_errors(by_id.values(), shots, required_links)
+        structure_errors = {**visual_structure_errors(by_id.values(), shots, required_links),
+                            **atom_budget_errors(by_id.values(), shots)}
         pending.update(structure_errors)
         if source_transfer:
             candidate_decision = offered if isinstance(offered, dict) else held_decision

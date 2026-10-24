@@ -780,93 +780,98 @@ jobs:
                   summary.write(f"- Source score (metadata): {score.get('final_score')}\n")
                   summary.write(f"- Analysis attempts: {len(attempts)}\n")
                   summary.write("- Each source analysis attempt is recorded in source_analysis_attempts.json. Only a successful analysis is handed to production.\n\n")
-              report = app.do_produce(cid)
-              production_attempts = [{"candidate_id": cid, "run_id": report.get("run_id"),
-                                      "failure_class": report.get("failure_class", ""),
-                                      "exit_code": report.get("exit_code")}]
-              # Only explicit transfer rejection triggers another source. Manual selection is never replaced.
-              if report.get("failure_class") == "TRANSFER_REJECTED" and selection_mode != "manual_from_prior_find":
-                  attempted_ids = {str(item.get("candidate_id") or "") for item in attempts}
-                  while report.get("failure_class") == "TRANSFER_REJECTED" and len(attempts) < analysis_limit:
-                      next_source = None
-                      for candidate2 in candidate_pool:
-                          candidate2_id = str(candidate2.get("id") or "").strip()
-                          if not candidate2_id or candidate2_id in attempted_ids:
-                              continue
-                          attempted_ids.add(candidate2_id)
-                          blocked = pattern_source_reason(candidate2)
-                          if blocked:
-                              skipped.append(f"{candidate2_id}: {blocked}")
-                              continue
-                          next_source = candidate2
-                          break
-                      if next_source is None:
-                          break
-                      cid2 = str(next_source.get("id") or "").strip()
-                      app.store.ingest([next_source], "github-find-" + find_reference, "found")
-                      app.store.decide(cid2, "shortlist", "Next ranked source after TRANSFER_REJECTED")
-                      try:
-                          status2 = app.do_analyze(cid2)
-                      except Exception as exc:
-                          status2 = {"status": "INTERNAL_ERROR", "detail": f"{type(exc).__name__}: {exc}"}
-                      saved_rows2 = app.store.analyses(cid2)
-                      saved2 = saved_rows2[0] if saved_rows2 else {}
-                      attempt2 = {"candidate_id": cid2, "status": str(status2.get("status") or "UNKNOWN").upper(),
-                                  "detail": str(status2.get("detail") or "")[:500]}
-                      attempts.append(attempt2)
-                      print(f"Transfer fallback analysis: candidate={cid2} status={attempt2['status']} detail={attempt2['detail']}")
-                      if attempt2["status"] != "OK":
-                          if attempt2["status"] in retryable_analysis_statuses:
-                              continue
-                          break
-                      selected_candidate = next_source
-                      cid = cid2
-                      candidate = next_source
-                      status = status2
-                      saved = saved2
-                      score = next_source.get("source_score") or {}
-                      score = score if isinstance(score, dict) else {}
-                      components = score.get("components") or {}
-                      components = components if isinstance(components, dict) else {}
-                      money_gate = components.get("money_signal_gate") or {}
-                      money_gate = money_gate if isinstance(money_gate, dict) else {}
-                      analysis = {"candidate_id": cid2, "analysis_id": status2.get("analysis_id"),
-                                  "status": status2.get("status"), "selection_mode": selection_mode,
-                                  "source_use_policy": "PATTERN_EXTRACTION_NOT_COMMERCIAL_APPROVAL",
-                                  "commercial_gate_passed": bool(money_gate.get("pass")),
-                                  "source_relevance": (next_source.get("source_check") or {}).get("classification", "UNKNOWN"),
-                                  "source_score": score.get("final_score"),
-                                  "source_evidence_scope": "six sampled video frames only; mechanism and transferability remain hypotheses",
-                                  "result": saved2.get("result"), "warnings": status2.get("warnings", []),
-                                  "detail": status2.get("detail", "")}
-                      report = app.do_produce(cid2)
-                      production_attempts.append({"candidate_id": cid2, "run_id": report.get("run_id"),
-                                                  "failure_class": report.get("failure_class", ""),
-                                                  "exit_code": report.get("exit_code")})
-                  (out / "source_transfer_attempts.json").write_text(
-                      json.dumps({"selection_mode": selection_mode, "attempts": production_attempts,
-                                  "selected_candidate_id": cid}, ensure_ascii=False, indent=2), encoding="utf-8")
-                  score = candidate.get("source_score") or {}
-                  score = score if isinstance(score, dict) else {}
-                  selection = {"candidate_id": cid, "selection_mode": selection_mode,
-                               "brand": candidate.get("brand_name") or candidate.get("brand"),
-                               "title": candidate.get("title"), "source_url": candidate.get("source_url"),
-                               "video_url_present": bool(candidate.get("video_url")),
-                               "source_check": candidate.get("source_check"), "source_score": score,
-                               "analysis_attempts": len(attempts)}
-                  (out / "selected_candidate.json").write_text(
-                      json.dumps(selection, ensure_ascii=False, indent=2), encoding="utf-8")
-                  (out / "source_analysis.json").write_text(
-                      json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
-                  (out / "source_analysis_attempts.json").write_text(
-                      json.dumps({"selection_mode": selection_mode, "max_candidates": analysis_limit,
-                                  "attempts": attempts, "skipped": skipped, "selected_candidate_id": cid},
-                                 ensure_ascii=False, indent=2), encoding="utf-8")
-                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-                      summary.write("## Transfer-decision fallback\n\n")
-                      for item in production_attempts:
-                          summary.write(f"- {item['candidate_id']}: {item['failure_class'] or 'UNKNOWN'} (exit={item['exit_code']})\n")
-                      summary.write(f"\nFinal candidate: {cid}. Manual selection is never auto-replaced.\n\n")
+              from cme.radar.source_loop import run_source_loop
+
+              initial_candidate, initial_cid = candidate, cid
+              initial_status, initial_analysis, initial_saved = status, analysis, saved
+              # The earlier analysis attempts already consume the candidate budget, except for
+              # the currently selected source which is cached and is not re-analysed here.
+              already_analyzed = {str(item.get("candidate_id") or "") for item in attempts}
+              loop_pool = [initial_candidate] + [
+                  item for item in candidate_pool
+                  if str(item.get("id") or "").strip() not in already_analyzed
+                  and str(item.get("id") or "").strip() != initial_cid
+              ]
+              remaining_limit = max(1, analysis_limit - max(0, len(attempts) - 1))
+
+              def analyze_for_transfer(source):
+                  source_id = str(source.get("id") or "").strip()
+                  if source_id == initial_cid:
+                      return ({"candidate_id": source_id, "status": "OK", "detail": initial_status.get("detail", "")},
+                              {"status": initial_status, "analysis": initial_analysis, "saved": initial_saved})
+                  app.store.ingest([source], "github-find-" + find_reference, "found")
+                  app.store.decide(source_id, "shortlist", "Next ranked source after TRANSFER_REJECTED")
+                  try:
+                      status_next = app.do_analyze(source_id)
+                  except Exception as exc:
+                      status_next = {"status": "INTERNAL_ERROR", "detail": f"{type(exc).__name__}: {exc}"}
+                  rows_next = app.store.analyses(source_id)
+                  saved_next = rows_next[0] if rows_next else {}
+                  score_next = source.get("source_score") or {}
+                  score_next = score_next if isinstance(score_next, dict) else {}
+                  components_next = score_next.get("components") or {}
+                  components_next = components_next if isinstance(components_next, dict) else {}
+                  money_next = components_next.get("money_signal_gate") or {}
+                  money_next = money_next if isinstance(money_next, dict) else {}
+                  analysis_next = {"candidate_id": source_id, "analysis_id": status_next.get("analysis_id"),
+                                   "status": status_next.get("status"), "selection_mode": selection_mode,
+                                   "source_use_policy": "PATTERN_EXTRACTION_NOT_COMMERCIAL_APPROVAL",
+                                   "commercial_gate_passed": bool(money_next.get("pass")),
+                                   "source_relevance": (source.get("source_check") or {}).get("classification", "UNKNOWN"),
+                                   "source_score": score_next.get("final_score"),
+                                   "source_evidence_scope": "six sampled video frames only; mechanism and transferability remain hypotheses",
+                                   "result": saved_next.get("result"), "warnings": status_next.get("warnings", []),
+                                   "detail": status_next.get("detail", "")}
+                  attempt_next = {"candidate_id": source_id, "status": str(status_next.get("status") or "UNKNOWN").upper(),
+                                  "detail": str(status_next.get("detail") or "")[:500]}
+                  attempts.append(attempt_next)
+                  print(f"Transfer fallback analysis: candidate={source_id} status={attempt_next['status']} detail={attempt_next['detail']}")
+                  return attempt_next, {"status": status_next, "analysis": analysis_next, "saved": saved_next}
+
+              def produce_for_transfer(source, _payload):
+                  return app.do_produce(str(source.get("id") or "").strip())
+
+              loop_result = run_source_loop(
+                  loop_pool, limit=remaining_limit, analyze=analyze_for_transfer, produce=produce_for_transfer,
+                  skip_reason=pattern_source_reason,
+                  allow_transfer_fallback=(selection_mode != "manual_from_prior_find"), skipped=skipped)
+              if loop_result.selected is None or loop_result.report is None:
+                  details = "; ".join(loop_result.skipped[-5:]) or "no eligible candidate completed analysis"
+                  raise SystemExit("No candidate reached production: " + details)
+              candidate = loop_result.selected
+              cid = str(candidate.get("id") or "").strip()
+              status = loop_result.payload["status"]
+              analysis = loop_result.payload["analysis"]
+              saved = loop_result.payload["saved"]
+              report = loop_result.report
+              transfer_rejections = loop_result.rejections
+
+              score = candidate.get("source_score") or {}
+              score = score if isinstance(score, dict) else {}
+              selection = {"candidate_id": cid, "selection_mode": selection_mode,
+                           "brand": candidate.get("brand_name") or candidate.get("brand"),
+                           "title": candidate.get("title"), "source_url": candidate.get("source_url"),
+                           "video_url_present": bool(candidate.get("video_url")),
+                           "source_check": candidate.get("source_check"), "source_score": score,
+                           "analysis_attempts": len(attempts)}
+              (out / "selected_candidate.json").write_text(
+                  json.dumps(selection, ensure_ascii=False, indent=2), encoding="utf-8")
+              (out / "source_analysis.json").write_text(
+                  json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+              (out / "source_analysis_attempts.json").write_text(
+                  json.dumps({"selection_mode": selection_mode, "max_candidates": analysis_limit,
+                              "attempts": attempts, "skipped": skipped,
+                              "selected_candidate_id": cid}, ensure_ascii=False, indent=2), encoding="utf-8")
+              (out / "source_transfer_attempts.json").write_text(
+                  json.dumps({"selection_mode": selection_mode, "rejections": transfer_rejections,
+                              "selected_candidate_id": cid,
+                              "last_failure_class": report.get("failure_class", "")},
+                             ensure_ascii=False, indent=2), encoding="utf-8")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write("## Transfer-decision fallback\n\n")
+                  for item in transfer_rejections:
+                      summary.write(f"- {item['candidate_id']}: {item['reason'] or 'TRANSFER_REJECTED'}\n")
+                  summary.write(f"\nFinal candidate: `{cid}`; manual selection is never replaced.\n\n")
               work_prod = work / "production" / report["run_id"]
               dest = out / "production" / report["run_id"]
               if work_prod.is_dir():
@@ -898,7 +903,8 @@ jobs:
                        "failure_class": failure_class,
                        "offer_name": report.get("offer_name"), "images": report.get("images", []),
                        "verdicts": verdict_values, "provider_calls_made": report.get("provider_calls_made", 0),
-                       "stdout_tail": report.get("stdout_tail", ""), "stderr_tail": report.get("stderr_tail", "")}
+                       "stdout_tail": report.get("stdout_tail", ""), "stderr_tail": report.get("stderr_tail", ""),
+                       "transfer_rejections": transfer_rejections}
               (out / "live_result.json").write_text(json.dumps(brief, ensure_ascii=False, indent=2), encoding="utf-8")
               print(json.dumps(brief, ensure_ascii=False, indent=2))
               code = report.get("exit_code")
