@@ -570,16 +570,21 @@ jobs:
           from cme.radar.server import ROOT, RadarApp
 
           out = Path("out").resolve()
-          from cme.radar.select import pattern_source_reason, select_transfer_candidate
+          from cme.radar.select import pattern_source_reason, rank_transfer_candidates
           requested_cid = os.environ.get("CANDIDATE_ID", "").strip()
+          skipped = []
           if requested_cid:
               candidates_file = Path("find-input/candidates.json")
               if not candidates_file.is_file():
                   raise SystemExit("FIND artifact lacks candidates.json")
               candidates = json.loads(candidates_file.read_text(encoding="utf-8")).get("candidates", [])
-              candidate = next((c for c in candidates if c.get("id") == requested_cid), None)
-              if candidate is None:
-                  raise SystemExit(f"candidate_id {requested_cid!r} is not in this FIND artifact")
+              selected = next((c for c in candidates if c.get("id") == requested_cid), None)
+              if selected is None:
+                  raise SystemExit(f"candidate_id {requested_cid!r} is not in this FIND run")
+              reason = pattern_source_reason(selected)
+              if reason:
+                  raise SystemExit(f"Candidate cannot be used for pattern extraction ({reason}); no Analyst call was made.")
+              candidate_pool = [selected]  # An explicit operator choice is never silently replaced.
               selection_mode = "manual_from_prior_find"
           else:
               candidates_file = out / "candidates.json"
@@ -615,11 +620,11 @@ jobs:
                           title = str(c.get("title") or "(no title)").replace("\n", " ")[:160]
                           brand = str(c.get("brand") or "unknown brand")[:80]
                           url = c.get("source_url") if isinstance(c.get("source_url"), str) and str(c.get("source_url")).startswith("https://") else ""
-                          summary.write(f"- `candidate_id: {c['id']}` — {brand}: {title}; score={c.get('final_score')}; video={'yes' if c.get('video_url_present') else 'no'}; [open ad]({url})\n")
-                      summary.write("\nThe first candidate in existing FIND order with a video and no hard exclusion is passed to pattern analysis. Commercial score, scorer REJECT, duration and relevance labels remain metadata; they do not gate creation of a test creative.\n")
+                          summary.write(f"- candidate_id: {c['id']} — {brand}: {title}; score={c.get('final_score')}; video={'yes' if c.get('video_url_present') else 'no'}; {url}\n")
+                      summary.write("\nCommercially strong sources are tried first. If analysis of a source fails because its video is unavailable, the Analyst provider errors, or the model output is invalid, CME tries the next eligible source, up to three candidates. An explicit candidate_id is never replaced automatically.\n")
               candidates = json.loads(candidates_file.read_text(encoding="utf-8")).get("candidates", [])
-              candidate, skipped = select_transfer_candidate(candidates)  # preserve FIND order; commercial metrics do not gate pattern transfer
-              if candidate is None:
+              candidate_pool, skipped = rank_transfer_candidates(candidates)
+              if not candidate_pool:
                   stats = json.loads(candidates_file.read_text(encoding="utf-8")).get("stats") or {}
                   diag = json.loads(candidates_file.read_text(encoding="utf-8")).get("diagnostics") or {}
                   calls = stats.get("calls") or []
@@ -635,32 +640,7 @@ jobs:
                   raise SystemExit("FIND returned no usable pattern source (requires a video and no hard exclusion): "
                                    + skip_text + " " + diagnosis + "No analyst/generator calls were made.")
               selection_mode = "automatic_best_valid_ranked"
-          cid = str(candidate.get("id") or "").strip()
-          if not cid:
-              raise SystemExit("Selected candidate has no stable candidate ID.")
-          source_block = pattern_source_reason(candidate)
-          if source_block:
-              raise SystemExit(f"Selected candidate cannot be used for pattern transfer ({source_block}); no analyst/generator calls were made.")
-          if not candidate.get("video_url"):
-              raise SystemExit("Selected ad has no video URL; no analyst/generator calls were made.")
-          selected_check = candidate.get("source_check") or {}
-          if selected_check.get("excluded") or str(selected_check.get("classification") or "").upper() == "HARD_EXCLUDE":
-              raise SystemExit("Selected source is hard-excluded by the legacy vertical classifier; no analyst/generator calls were made.")
-          selection = {"candidate_id": cid, "selection_mode": selection_mode,
-                       "brand": candidate.get("brand_name") or candidate.get("brand"),
-                       "title": candidate.get("title"), "source_url": candidate.get("source_url"),
-                       "video_url_present": bool(candidate.get("video_url")),
-                       "source_check": candidate.get("source_check"),
-                       "source_score": candidate.get("source_score")}
-          (out / "selected_candidate.json").write_text(json.dumps(selection, ensure_ascii=False, indent=2), encoding="utf-8")
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              summary.write("## CME source selected\n\n")
-              summary.write(f"- Mode: {selection_mode}\n")
-              summary.write(f"- Candidate ID: `{cid}`\n")
-              summary.write(f"- Brand/title: {selection.get('brand') or 'unknown'} — {selection.get('title') or '(no title)'}\n")
-              summary.write(f"- Source relevance: {(candidate.get('source_check') or {}).get('classification', 'UNKNOWN')}\n")
-              summary.write(f"- Source score (metadata): {(candidate.get('source_score') or {}).get('final_score')}\n")
-              summary.write("- FIND order is preserved. Commercial metrics inform prioritization but do not decide whether a pattern can be transferred.\n\n")
+
           work = Path("radar-work").resolve()
           if work.exists():
               shutil.rmtree(work)
@@ -669,31 +649,113 @@ jobs:
                          production_shots=int(os.environ["SHOTS"]))
           try:
               find_reference = os.environ.get("FIND_RUN_ID", "").strip() or ("internal-" + os.environ.get("GITHUB_RUN_ID", "unknown"))
-              app.store.ingest([candidate], "github-find-" + find_reference, "found")
-              reason = ("Selected manually from GitHub Actions FIND" if selection_mode == "manual_from_prior_find"
-                        else "Automatically selected as the first usable video candidate in FIND order")
-              app.store.decide(cid, "shortlist", reason)
-              status = app.do_analyze(cid)
-              saved_rows = app.store.analyses(cid)
-              saved = saved_rows[0] if saved_rows else {}
+              analysis_limit = 1 if selection_mode == "manual_from_prior_find" else 3
+              retryable_analysis_statuses = {"NO_VIDEO", "VIDEO_UNAVAILABLE", "API_ERROR", "INVALID_OUTPUT"}
+              attempts = []
+              selected_candidate = None
+              final_status = {}
+              final_analysis = {}
+              final_saved = {}
+
+              for source in candidate_pool[:analysis_limit]:
+                  cid = str(source.get("id") or "").strip()
+                  if not cid:
+                      skipped.append("candidate without a stable ID")
+                      continue
+                  source_block = pattern_source_reason(source)
+                  if source_block:
+                      skipped.append(f"{cid}: {source_block}")
+                      continue
+                  app.store.ingest([source], "github-find-" + find_reference, "found")
+                  reason = ("Selected manually from GitHub Actions FIND" if selection_mode == "manual_from_prior_find"
+                            else "Eligible automatic source tried in FIND ranking order")
+                  app.store.decide(cid, "shortlist", reason)
+                  try:
+                      status = app.do_analyze(cid)
+                  except Exception as exc:
+                      # Unexpected implementation/configuration errors are recorded and stop fallback.
+                      status = {"status": "INTERNAL_ERROR", "detail": f"{type(exc).__name__}: {exc}"}
+                  saved_rows = app.store.analyses(cid)
+                  saved = saved_rows[0] if saved_rows else {}
+                  score = source.get("source_score") or {}
+                  score = score if isinstance(score, dict) else {}
+                  components = score.get("components") or {}
+                  components = components if isinstance(components, dict) else {}
+                  money_gate = components.get("money_signal_gate") or {}
+                  money_gate = money_gate if isinstance(money_gate, dict) else {}
+                  analysis = {"candidate_id": cid, "analysis_id": status.get("analysis_id"),
+                              "status": status.get("status"), "selection_mode": selection_mode,
+                              "source_use_policy": "PATTERN_EXTRACTION_NOT_COMMERCIAL_APPROVAL",
+                              "commercial_gate_passed": bool(money_gate.get("pass")),
+                              "source_relevance": (source.get("source_check") or {}).get("classification", "UNKNOWN"),
+                              "source_score": score.get("final_score"),
+                              "source_evidence_scope": "six sampled video frames only; mechanism and transferability remain hypotheses",
+                              "result": saved.get("result"), "warnings": status.get("warnings", []),
+                              "detail": status.get("detail", "")}
+                  attempt = {"candidate_id": cid, "status": str(status.get("status") or "UNKNOWN").upper(),
+                             "detail": str(status.get("detail") or "")[:500]}
+                  attempts.append(attempt)
+                  print(f"Source analysis: candidate={cid} status={attempt['status']} detail={attempt['detail']}")
+                  final_status, final_analysis, final_saved = status, analysis, saved
+                  if attempt["status"] == "OK":
+                      selected_candidate = source
+                      break
+                  if attempt["status"] not in retryable_analysis_statuses:
+                      break
+
+              attempt_artifact = {"selection_mode": selection_mode, "max_candidates": analysis_limit,
+                                  "attempts": attempts, "skipped": skipped,
+                                  "selected_candidate_id": selected_candidate.get("id") if selected_candidate else None}
+              (out / "source_analysis_attempts.json").write_text(
+                  json.dumps(attempt_artifact, ensure_ascii=False, indent=2), encoding="utf-8")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write("## Source analysis attempts\n\n")
+                  for item in attempts:
+                      summary.write(f"- candidate_id: {item['candidate_id']} · status: {item['status']} · {item['detail'] or '(no detail)'}\n")
+                  if selected_candidate:
+                      summary.write(f"\nSelected candidate: {selected_candidate.get('id')} after {len(attempts)} analysis attempt(s).\n\n")
+                  else:
+                      summary.write(f"\nNo candidate produced a valid analysis after {len(attempts)} attempt(s). See source_analysis_attempts.json.\n\n")
+
+              if selected_candidate is None:
+                  if final_analysis:
+                      (out / "source_analysis.json").write_text(
+                          json.dumps(final_analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+                  failure = {**final_analysis, "status": "SOURCE_ANALYSIS_FAILED",
+                             "analysis_status": final_status.get("status"),
+                             "analysis_attempts": attempts, "skipped_candidates": skipped}
+                  (out / "live_result.json").write_text(
+                      json.dumps(failure, ensure_ascii=False, indent=2), encoding="utf-8")
+                  attempted_statuses = {item["status"] for item in attempts}
+                  exit_code = 5 if attempted_statuses.intersection({"API_ERROR", "INVALID_OUTPUT"}) else 4
+                  raise SystemExit(exit_code)
+
+              candidate = selected_candidate
+              cid = str(candidate.get("id") or "").strip()
+              status = final_status
+              analysis = final_analysis
+              saved = final_saved
               score = candidate.get("source_score") or {}
               score = score if isinstance(score, dict) else {}
-              components = score.get("components") or {}
-              components = components if isinstance(components, dict) else {}
-              money_gate = components.get("money_signal_gate") or {}
-              money_gate = money_gate if isinstance(money_gate, dict) else {}
-              analysis = {"candidate_id": cid, "analysis_id": status.get("analysis_id"), "status": status.get("status"),
-                          "selection_mode": selection_mode,
-                          "source_use_policy": "PATTERN_EXTRACTION_NOT_COMMERCIAL_APPROVAL",
-                          "commercial_gate_passed": bool(money_gate.get("pass")),
-                          "source_relevance": (candidate.get("source_check") or {}).get("classification", "UNKNOWN"),
-                          "source_score": score.get("final_score"),
-                          "source_evidence_scope": "six sampled video frames only; mechanism and transferability remain hypotheses",
-                          "result": saved.get("result"), "warnings": status.get("warnings", []), "detail": status.get("detail", "")}
-              (out / "source_analysis.json").write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
-              if status.get("status") != "OK":
-                  (out / "live_result.json").write_text(json.dumps({"status": "SOURCE_ANALYSIS_FAILED", **analysis}, ensure_ascii=False, indent=2), encoding="utf-8")
-                  raise SystemExit(5 if status.get("status") in {"API_ERROR", "INVALID_OUTPUT"} else 4)
+              selection = {"candidate_id": cid, "selection_mode": selection_mode,
+                           "brand": candidate.get("brand_name") or candidate.get("brand"),
+                           "title": candidate.get("title"), "source_url": candidate.get("source_url"),
+                           "video_url_present": bool(candidate.get("video_url")),
+                           "source_check": candidate.get("source_check"), "source_score": score,
+                           "analysis_attempts": len(attempts)}
+              (out / "selected_candidate.json").write_text(
+                  json.dumps(selection, ensure_ascii=False, indent=2), encoding="utf-8")
+              (out / "source_analysis.json").write_text(
+                  json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write("## CME source selected\n\n")
+                  summary.write(f"- Mode: {selection_mode}\n")
+                  summary.write(f"- Candidate ID: {cid}\n")
+                  summary.write(f"- Brand/title: {selection.get('brand') or 'unknown'} — {selection.get('title') or '(no title)'}\n")
+                  summary.write(f"- Source relevance: {(candidate.get('source_check') or {}).get('classification', 'UNKNOWN')}\n")
+                  summary.write(f"- Source score (metadata): {score.get('final_score')}\n")
+                  summary.write(f"- Analysis attempts: {len(attempts)}\n")
+                  summary.write("- Each source analysis attempt is recorded in source_analysis_attempts.json. Only a successful analysis is handed to production.\n\n")
               report = app.do_produce(cid)
               work_prod = work / "production" / report["run_id"]
               dest = out / "production" / report["run_id"]
