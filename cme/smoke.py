@@ -18,7 +18,7 @@ from .brain import BrainError, build_source_transfer_context, derive_mechanism_l
 from .compiler import BudgetError
 from .offer import OfferError, load_offer
 from .providers import CallLog, InfraError, ProviderCallError, ProviderPolicyError
-from .qa import make_qa_checks, validate_product_references
+from .qa import brand_tokens, make_qa_checks, validate_product_references
 from .registry import SettingsError, load_catalog, load_settings, make_brain_call, make_image_provider, make_judge
 from .run import AttemptLimit, produce_shot
 from .state import StateMismatch, load_state, new_run, save_state
@@ -178,7 +178,8 @@ def run_frame(args, offer, settings, catalog, vertical, log, run_id, ctx, out, a
     provider = make_image_provider(settings, catalog, log, run_id, image_seed=image_seed, **ctx)
     judge = make_judge(settings, catalog, log, run_id, **ctx) if settings.judge_adapter else None
     qa = make_qa_checks(atoms, args.shot, judge_fn=judge, ocr_required=not args.no_ocr_required,
-                        verified_claims=offer.verified_claims, product_references=offer.photos)
+                        verified_claims=offer.verified_claims, product_references=offer.photos,
+                        allowed_text=brand_tokens(offer.name, offer.product_type))
     refs = [state.shots[args.shot - 1]["image_path"]] if (args.shot - 1) in state.shots else []
     try:
         receipt, compiled, verdict = produce_shot(
@@ -250,7 +251,14 @@ def main(argv=None, ctx=None) -> int:
             for shot_number in shot_numbers:
                 args.shot = shot_number
                 frame_run_id = args.run_id if shot_number == 1 else f"{args.run_id}-s{shot_number:02d}"
-                verdict = run_frame(args, offer, settings, catalog, vertical, log, frame_run_id, ctx, out, data, atom_provenance)
+                # Retry only rejected/undelivered frames; UNVERIFIED is a checker failure, not a frame failure.
+                tries = max(1, int(settings.max_attempts_per_shot or 1)) if args.command == "all" else 1
+                for attempt_number in range(1, tries + 1):
+                    args.attempt = attempt_number
+                    verdict = run_frame(args, offer, settings, catalog, vertical, log, frame_run_id, ctx, out, data, atom_provenance)
+                    if verdict not in ("FAILED_QA", "NOT_DELIVERED") or attempt_number == tries:
+                        break
+                    print(f"Кадр {shot_number}: попытка {attempt_number} не прошла QA ({verdict}); новая попытка с другим seed.")
                 if verdict == "UNVERIFIED":
                     return 6
                 if verdict in ("FAILED_QA", "NOT_DELIVERED"):
