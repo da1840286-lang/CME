@@ -570,7 +570,8 @@ jobs:
           from cme.radar.server import ROOT, RadarApp
 
           out = Path("out").resolve()
-          from cme.radar.select import pattern_source_reason, rank_transfer_candidates
+          from cme.radar.select import pattern_source_reason, select_transfer_candidate
+          from cme.radar.select import rank_transfer_candidates
           requested_cid = os.environ.get("CANDIDATE_ID", "").strip()
           skipped = []
           if requested_cid:
@@ -621,9 +622,13 @@ jobs:
                           brand = str(c.get("brand") or "unknown brand")[:80]
                           url = c.get("source_url") if isinstance(c.get("source_url"), str) and str(c.get("source_url")).startswith("https://") else ""
                           summary.write(f"- candidate_id: {c['id']} — {brand}: {title}; score={c.get('final_score')}; video={'yes' if c.get('video_url_present') else 'no'}; {url}\n")
-                      summary.write("\nCommercially strong sources are tried first. If analysis of a source fails because its video is unavailable, the Analyst provider errors, or the model output is invalid, CME tries the next eligible source, up to three candidates. An explicit candidate_id is never replaced automatically.\n")
+                      summary.write("\nRelevance and commercial scores are retained as ranking/evidence metadata, not hard transfer gates. Commercially strong sources are tried first. If analysis fails because a video's unavailable, the Analyst provider errors, or model output is invalid, CME tries the next eligible source, up to three candidates. An explicit candidate_id is never replaced automatically.\n")
               candidates = json.loads(candidates_file.read_text(encoding="utf-8")).get("candidates", [])
-              candidate_pool, skipped = rank_transfer_candidates(candidates)
+              candidate, skipped = select_transfer_candidate(candidates)
+              candidate_pool, ranked_skipped = rank_transfer_candidates(candidates)
+              if candidate is not None:
+                  candidate_pool = [candidate] + [item for item in candidate_pool if item.get("id") != candidate.get("id")]
+              skipped = ranked_skipped
               if not candidate_pool:
                   stats = json.loads(candidates_file.read_text(encoding="utf-8")).get("stats") or {}
                   diag = json.loads(candidates_file.read_text(encoding="utf-8")).get("diagnostics") or {}
