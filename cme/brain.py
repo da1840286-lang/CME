@@ -5,6 +5,7 @@
 from __future__ import annotations
 import re
 from .atoms import ATOM_SCHEMA, TRANSFER_ATOM_SCHEMA, check_claims, check_language, parse_atoms
+from .branding import TARGET_BRAND_ALLOWED, brain_branding_rule
 from .vertical import check_vertical
 
 
@@ -397,6 +398,10 @@ def validate_transfer_decision(decision, atoms) -> list:
 
 
 def build_request(offer, brief: str, shots: int, failed=None, source_transfer=None) -> dict:
+    branding_rule = brain_branding_rule(
+        getattr(offer, "branding_policy", TARGET_BRAND_ALLOWED),
+        getattr(offer, "approved_brand_marks", ()),
+    )
     req = {"schema": TRANSFER_ATOM_SCHEMA if source_transfer else ATOM_SCHEMA, "offer": offer.to_dict(), "brief": brief, "shots": shots,
            "rules": ["Return atoms only, no finished prompts.",
                      "Every kind='claim' atom must copy one verified claim verbatim and use channel='qa'; it records offer truth, not pixels.",
@@ -404,7 +409,7 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
                      "Do not treat abstract care or durability claims as visually verifiable from a generic still. Ask for a visible label only when the brief explicitly requires on-image text.",
                      "Every kind='qa_check' atom must use channel='qa'; it is a verification criterion and must not be included in the image-generation prompt.",
                      "Do not emit an atom whose id is 'qa_no_text' or starts with 'qa_no_text_'. The canonical no-added-text requirement is injected and checked by code, so Brain must not author a duplicate QA criterion.",
-                     "Never invent text, pseudo-lettering, logos, brand names or labels. Reproduce them only when present in supplied product assets or explicitly specified by the offer/brief.",
+                      branding_rule,
                      "Never use a forbidden claim.",
                      "When target-product reference photos are supplied, preserve the actual target product's form factor, silhouette, proportions, and distinctive visible parts. Keep the target product body recognizable in the frame; do not substitute a generic lookalike or change a compact handheld product into an upright/stick device.",
                      "Write every atom text in English, even when the input context is in another language. Translate the source statements; never copy non-English words into atoms.",

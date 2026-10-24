@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 from .atoms import check_claims, check_language, parse_atoms
+from .branding import allowed_brand_tokens
 from .brain import (BrainError, TransferRejected, atom_budget_errors, build_source_transfer_context,
                     derive_mechanism_links, missing_mechanism_links, reserved_system_atom_errors,
                     validate_transfer_decision, visual_structure_errors, request_atoms)
@@ -44,7 +45,9 @@ def offer_fingerprint(offer) -> tuple[str, list]:
     payload = {"offer_id": offer.offer_id, "name": offer.name, "product_type": offer.product_type,
                "verified_claims": list(offer.verified_claims), "forbidden_claims": list(offer.forbidden_claims),
                "photo_hashes": photo_hashes, "platform": offer.platform, "geo": offer.geo,
-               "product_category": offer.product_category, "confirmations": list(offer.confirmations)}
+               "product_category": offer.product_category, "confirmations": list(offer.confirmations),
+               "branding_policy": getattr(offer, "branding_policy", "target_brand_allowed"),
+               "approved_brand_marks": list(getattr(offer, "approved_brand_marks", ()))}
     return _sha256_bytes(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")), photo_hashes
 
 
@@ -214,10 +217,18 @@ def run_frame(args, offer, settings, catalog, vertical, log, run_id, ctx, out, a
             transfer_decision = json.loads(manifest_path.read_text(encoding="utf-8")).get("transfer_decision")
         except (OSError, ValueError):
             transfer_decision = None
-    qa = make_qa_checks(atoms, args.shot, judge_fn=judge, ocr_required=not args.no_ocr_required,
-                        verified_claims=offer.verified_claims, product_references=offer.photos,
-                        allowed_text=brand_tokens(offer.name, offer.product_type),
-                        transfer_decision=transfer_decision)
+    approved_marks = offer.approved_brand_marks
+    if offer.branding_policy == "target_brand_allowed" and not approved_marks:
+        approved_marks = (offer.name,)
+    qa = make_qa_checks(
+        atoms, args.shot, judge_fn=judge, ocr_required=not args.no_ocr_required,
+        verified_claims=offer.verified_claims, product_references=offer.photos,
+        allowed_text=allowed_brand_tokens(
+            offer.branding_policy, offer.approved_brand_marks, offer.name, offer.product_type
+        ),
+        transfer_decision=transfer_decision, branding_policy=offer.branding_policy,
+        approved_brand_marks=approved_marks,
+    )
     refs = [state.shots[args.shot - 1]["image_path"]] if (args.shot - 1) in state.shots else []
     try:
         receipt, compiled, verdict = produce_shot(

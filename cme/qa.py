@@ -10,15 +10,12 @@ from pathlib import Path
 from collections.abc import Sequence
 from PIL import Image, ImageChops, ImageStat
 from .atoms import Atom, norm
+from .branding import NO_BRANDING, TARGET_BRAND_ALLOWED, qa_branding_rule
 
 
 PRODUCT_IDENTITY_CHECK_ID = "cme_product_identity_ref"
 SYSTEM_NO_TEXT_ID = "system_no_text_policy"
-SYSTEM_NO_TEXT_RULE = (
-    "No added text overlays, captions, subtitles, UI, watermarks, or promotional wording. "
-    "Lettering physically printed on the target product itself is product-native, not an overlay; "
-    "when target-product references are supplied, its markings must be consistent with them."
-)
+SYSTEM_NO_TEXT_RULE = qa_branding_rule(TARGET_BRAND_ALLOWED)
 MAX_PRODUCT_REFERENCES_FOR_JUDGE = 3
 
 
@@ -246,7 +243,7 @@ def judge_batch_checks(path, atoms, judge_fn, required=False, reference_images=(
 
 def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr_required=True,
                    text_allowed=False, anchors=(), verified_claims=(), product_references=(), allowed_text=(),
-                   transfer_decision=None):
+                   transfer_decision=None, branding_policy=TARGET_BRAND_ALLOWED, approved_brand_marks=()):
     """Build QA for one shot, with independent visual checks for preserved source properties."""
     claims = [a for a in atoms if a.shot == shot and a.channel == "qa" and a.kind == "claim"]
     claim_set = {norm(c) for c in verified_claims}
@@ -256,10 +253,20 @@ def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr
     product_refs = tuple(str(p) for p in list(product_references or ())[:MAX_PRODUCT_REFERENCES_FOR_JUDGE])
 
     def run(path):
+        ocr_result = ocr_text_check(
+            "no_text", path, text_allowed, ocr=ocr, required=ocr_required, allowed_tokens=allowed_text
+        )
+        # Empty OCR stays NOT_RUN. A required visual Judge is the independent fallback in strict mode.
+        if (branding_policy == NO_BRANDING and judge_fn is not None
+                and ocr_result.status == "NOT_RUN"
+                and ocr_result.detail.startswith("OCR returned no confident words")):
+            ocr_result = replace(
+                ocr_result, required=False,
+                detail=ocr_result.detail + "; required system_no_text_policy visual Judge is the independent fallback"
+            )
         res = [file_check("file", path, expected_size),
                frame_content_check("frame_content", path),
-               ocr_text_check("no_text", path, text_allowed, ocr=ocr, required=ocr_required,
-                              allowed_tokens=allowed_text)]
+               ocr_result]
         for cid, prev, region, minimum in anchors:
             res.append(anchor_similarity(cid, prev, path, region, minimum))
         for a in claims:
@@ -269,7 +276,7 @@ def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr
                 "matches verified offer claim; not inferred from pixels" if valid
                 else "claim is absent from offer.verified_claims"))
         if judge_fn is not None:
-            system_no_text = Atom(SYSTEM_NO_TEXT_ID, "qa_check", SYSTEM_NO_TEXT_RULE, "MUST", "qa", shot)
+            system_no_text = Atom(SYSTEM_NO_TEXT_ID, "qa_check", qa_branding_rule(branding_policy, approved_brand_marks), "MUST", "qa", shot)
             judge_atoms = [*pool, system_no_text]
             transfer_check_ids = set()
             rows_by_id = {a.id: a for a in atoms}

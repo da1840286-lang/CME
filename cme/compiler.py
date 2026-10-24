@@ -1,6 +1,7 @@
 """Budget is code's job: drop MAY, then SHOULD; if MUST does not fit, stop with a list."""
 from __future__ import annotations
 from dataclasses import dataclass
+from .branding import branding_prompt_instruction
 
 IMAGE_LIMIT = 3600
 MOTION_LIMIT = 1700
@@ -44,9 +45,14 @@ def _fit(pool, limit, reserve, render):
     return Compiled(text, tuple(a.id for a in keep), tuple(dropped), len(text), limit)
 
 
-def compile_image_prompt(atoms, shot: int, limit: int = IMAGE_LIMIT, reserve: int = 0) -> Compiled:
+def compile_image_prompt(atoms, shot: int, limit: int = IMAGE_LIMIT, reserve: int = 0,
+                        branding_policy=None, approved_brand_marks=()) -> Compiled:
     pool = [a for a in atoms if a.shot == shot and a.channel == "image"]
-    return _fit(pool, limit, reserve, lambda sel: "\n".join(a.text for a in sel))
+    instruction = branding_prompt_instruction(branding_policy, approved_brand_marks) if branding_policy is not None else ""
+    def render(selected):
+        rows = ([instruction] if instruction else []) + [a.text for a in selected]
+        return "\n".join(rows)
+    return _fit(pool, limit, reserve, render)
 
 
 def compile_motion_prompt(atoms, limit: int = MOTION_LIMIT, reserve: int = 0) -> Compiled:

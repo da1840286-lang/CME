@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from .compiler import BudgetError, compile_image_prompt
+from .branding import NO_BRANDING, prepare_unbranded_reference
 from .atoms import check_claims, check_language
 from .receipt import assert_exact_payload, attach_qa, build_receipt, overall
 from .state import accept_shot, record_attempt
@@ -28,19 +29,36 @@ def _blocked(state, out, shot, attempt, status, detail):
             "commercial_status": "NOT_PRODUCED"})
 
 
-def _image_input_manifest(previous_refs, product_photos) -> list[dict]:
-    """Audit the exact ordered image-reference list handed to the provider without storing absolute paths."""
+def _file_sha256(path):
     import hashlib
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _image_input_manifest(previous_refs, product_photos, generation_product_photos=None,
+                          preparation_reports=(), branding_policy="target_brand_allowed") -> list[dict]:
+    """Audit exact generator inputs and original target-reference identity."""
     out = []
-    ordered = [("previous_generated_frame", p) for p in previous_refs]
-    ordered.extend(("target_product_photo", p) for p in product_photos)
-    for index, (role, raw_path) in enumerate(ordered, start=1):
+    for raw_path in previous_refs:
         path = Path(raw_path)
-        item = {"index": index, "role": role, "filename": path.name, "sha256": None, "available": path.is_file()}
-        if path.is_file():
-            try: item["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-            except OSError: item["available"] = False
-        out.append(item)
+        out.append({"index": len(out)+1, "role": "previous_generated_frame", "filename": path.name,
+                    "sha256": _file_sha256(path), "available": path.is_file()})
+    actual_refs = list(generation_product_photos or product_photos)
+    reports = list(preparation_reports or ())
+    for index, (raw_source, raw_actual) in enumerate(zip(product_photos, actual_refs)):
+        source, actual = Path(raw_source), Path(raw_actual)
+        role = "target_product_photo_unbranded_reference" if branding_policy == NO_BRANDING else "target_product_photo"
+        row = {"index": len(out)+1, "role": role, "filename": actual.name,
+               "sha256": _file_sha256(actual), "available": actual.is_file()}
+        if source.resolve() != actual.resolve():
+            row["source_filename"] = source.name
+            row["source_sha256"] = _file_sha256(source)
+        if index < len(reports):
+            row["preparation"] = {"status": reports[index].get("status"),
+                                  "masked_regions": reports[index].get("masked_regions", 0)}
+        out.append(row)
     return out
 
 
@@ -80,18 +98,44 @@ def produce_shot(*, offer, atoms, shot, contract_id, state, out_dir, image_provi
             raise GateError(reasons)
         ad_requirements = gate.requirements
     try:
-        compiled = compile_image_prompt(atoms, shot, reserve=reserve)
+        compiled = compile_image_prompt(
+            atoms, shot, reserve=reserve, branding_policy=offer.branding_policy,
+            approved_brand_marks=offer.approved_brand_marks,
+        )
     except BudgetError as e:
         _blocked(state, out, shot, attempt, "BLOCKED_BUDGET", str(e))
         raise
+    provider_product_refs = list(offer.photos)
+    preparation_reports = []
+    if offer.branding_policy == NO_BRANDING:
+        for index, source in enumerate(offer.photos, start=1):
+            destination = out / "reference_inputs" / f"target_product_unbranded_{index:02d}.png"
+            report = prepare_unbranded_reference(source, destination)
+            preparation_reports.append(report)
+            if report.get("status") in {"OCR_UNAVAILABLE", "OCR_FAILED"}:
+                detail = (
+                    f"no_branding cannot safely prepare target reference {Path(source).name}: "
+                    f"{report.get('status')} ({report.get('error_type', 'unknown error')}); "
+                    "install a working Tesseract OCR engine before generation"
+                )
+                _blocked(state, out, shot, attempt, "BLOCKED_BRANDING_REFERENCE", detail)
+                raise GateError([detail])
+            provider_product_refs[index-1] = report["path"]
+
     receipt = build_receipt(contract_id, state.run_id, shot, attempt, atoms, compiled.text)
-    assert_exact_payload(receipt, compiled.text)                   # nothing appended after binding
+    assert_exact_payload(receipt, compiled.text)
     image_path = out / "shots" / f"shot_{shot:02d}_a{attempt:02d}.png"
     image_path.parent.mkdir(parents=True, exist_ok=True)
-    provider_refs = list(refs) + list(offer.photos)  # existing order is preserved: previous frame, then target-product photos
+    provider_refs = list(refs) + provider_product_refs
     base = {"lost": compiled.lost_line(), "ad_requirements": list(ad_requirements),
             "provider": {}, "commercial_status": "TEST_ONLY",
-            "image_inputs": _image_input_manifest(refs, offer.photos)}
+            "branding_policy": offer.branding_policy,
+            "reference_preparation": [{"status": item.get("status"),
+                                       "masked_regions": item.get("masked_regions", 0)}
+                                      for item in preparation_reports],
+            "image_inputs": _image_input_manifest(
+                refs, offer.photos, provider_product_refs, preparation_reports, offer.branding_policy
+            )}
     try:
         image_path.write_bytes(image_provider(receipt.sent_prompt, provider_refs))
         base["provider"] = dict(getattr(image_provider, "info", {}) or {})

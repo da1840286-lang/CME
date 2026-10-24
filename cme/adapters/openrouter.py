@@ -157,9 +157,11 @@ def make_openrouter_judge(params: dict, api_key=None, transport=None):
         if refs:
             reqs.append({"id": identity_id, "requirement": (
                 "PRODUCT IDENTITY: compare the product visible in the generated frame with the original target-product reference image(s). "
-                "Ignore differences in background, lighting, camera, and composition. PASS only if product silhouette, construction, color, "
-                "and distinctive physical details are consistent. FAIL if the product is absent or materially different. "
-                "If the reference or generated view does not support a confident comparison, answer false. Evidence must describe visible product details, not prompt text.")})
+                "Ignore differences in background, lighting, camera, composition, branding and printed/embossed text. "
+                "Treat logo/label removal as intentional under the campaign branding policy; do not fail identity merely because those marks are absent. "
+                "PASS only if silhouette, construction, color, materials, controls and other non-text physical details are consistent. "
+                "FAIL if the product is absent or materially different. If the reference or generated view does not support a confident comparison, "
+                "answer false. Evidence must describe visible product details, not prompt text.")})
         user_content = [{"type": "text", "text": json.dumps(reqs, ensure_ascii=False)}]
         user_content.append({"type": "text", "text": "IMAGE A — GENERATED FRAME TO QA. Check every requested atom against this image."})
         user_content.append({"type": "image_url", "image_url": {"url": data_uri(image_path)}})
