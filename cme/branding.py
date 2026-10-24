@@ -43,8 +43,8 @@ def branding_prompt_instruction(policy, approved_brand_marks=()):
             "consistent with the OfferCard product name/model. "
         )
         return ("SYSTEM-OWNED BRANDING POLICY (target_brand_allowed; non-negotiable): " + allow +
-                "Never copy source-ad, competitor or unrelated branding. Never invent logos or lettering. "
-                "No captions, subtitles, UI, watermarks or promotional text.")
+                "Never invent text, pseudo-lettering, logos, brand names or labels beyond the explicitly approved target marks. "
+                "Never copy source-ad, competitor or unrelated branding. No captions, subtitles, UI, watermarks or promotional text.")
     raise ValueError(f"unsupported branding_policy {policy!r}")
 
 def brain_branding_rule(policy, approved_brand_marks=()):
@@ -62,8 +62,9 @@ def brain_branding_rule(policy, approved_brand_marks=()):
             "OfferCard name/model may be shown. "
         )
         return ("CAMPAIGN BRANDING POLICY: target_brand_allowed. " + allow +
-                "Never copy source-ad/competitor branding or invent a logo. Do not add text overlays, captions, "
-                "subtitles, UI, watermarks or promotional wording.")
+                "Never invent text, pseudo-lettering, logos, brand names or labels beyond the approved target marks. "
+                "Never copy source-ad/competitor branding. Do not add text overlays, captions, subtitles, UI, "
+                "watermarks or promotional wording.")
     raise ValueError(f"unsupported branding_policy {policy!r}")
 
 def qa_branding_rule(policy, approved_brand_marks=()):
