@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from cme.qa import brand_tokens, ocr_text_check
 from cme.radar.select import rank_transfer_candidates, select_transfer_candidate
@@ -45,6 +46,26 @@ class OcrWordRulesTests(unittest.TestCase):
         def boom(p):
             raise RuntimeError("no engine")
         self.assertEqual(ocr_text_check("o", "x.png", False, ocr=boom).status, "NOT_RUN")
+
+    def test_alternative_layout_finds_text_missed_by_default_layout(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "frame.png"
+            Image.new("RGB", (64, 96), (128, 128, 128)).save(path)
+            outputs = {
+                "--psm 3": {"text": [""], "conf": ["-1"]},
+                "--psm 11": {"text": ["Brushless", "motor"], "conf": ["90", "81"]},
+                "--psm 12": {"text": ["motor"], "conf": ["80"]},
+            }
+            def fake_image_to_data(image, *, config, output_type):
+                return outputs[config]
+            with patch("pytesseract.image_to_data", side_effect=fake_image_to_data) as mocked:
+                result = ocr_text_check("no_text", path, False, allowed_tokens=BRAND)
+            self.assertEqual(result.status, "FAIL", result.detail)
+            self.assertEqual(
+                [call.kwargs["config"] for call in mocked.call_args_list],
+                ["--psm 3", "--psm 11", "--psm 12"],
+            )
 
     @unittest.skipUnless(shutil.which("tesseract"), "tesseract not installed")
     def test_real_tesseract_ignores_noise_keeps_promo(self):

@@ -189,7 +189,9 @@ class QATests(unittest.TestCase):
             self.assertEqual(anchor_similarity("an", a, c, (0, 0, 0.6, 0.6)).status, "FAIL")
 
     def test_ocr_never_silent_pass(self):
-        self.assertEqual(ocr_text_check("o", "x.png", False, ocr=lambda p: "").status, "PASS")
+        for raw in ("", "   \n\t  "):
+            with self.subTest(raw=repr(raw)):
+                self.assertEqual(ocr_text_check("o", "x.png", False, ocr=lambda p, value=raw: value).status, "NOT_RUN")
         self.assertEqual(ocr_text_check("o", "x.png", False, ocr=lambda p: "PATCH REVIEW LOTS OF TEXT").status, "FAIL")
         def broken(p):
             raise RuntimeError("no engine")

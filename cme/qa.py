@@ -126,18 +126,28 @@ def brand_tokens(name: str, product_type: str = "") -> tuple:
 
 
 def _tesseract_confident_words(path) -> str:
+    """Read confident text using several page-segmentation modes.
+
+    Short promotional overlays can be missed by Tesseract's default layout mode. Try
+    both block and sparse-text layouts so an empty first pass cannot hide visible text.
+    """
     import pytesseract  # optional dependency
-    with Image.open(path) as im:
-        data = pytesseract.image_to_data(im, output_type=pytesseract.Output.DICT)
     words = []
-    for word, conf in zip(data.get("text", []), data.get("conf", [])):
-        try:
-            c = float(conf)
-        except (TypeError, ValueError):
-            continue
-        if str(word).strip() and c >= OCR_MIN_CONF:
-            words.append(str(word).strip())
-    return " ".join(words)
+    with Image.open(path) as im:
+        for psm in (3, 11, 12):
+            data = pytesseract.image_to_data(
+                im, config=f"--psm {psm}", output_type=pytesseract.Output.DICT
+            )
+            for word, conf in zip(data.get("text", []), data.get("conf", [])):
+                try:
+                    c = float(conf)
+                except (TypeError, ValueError):
+                    continue
+                word = str(word).strip()
+                if word and c >= OCR_MIN_CONF:
+                    words.append(word)
+    # The same visible word is often returned by more than one layout pass.
+    return " ".join(dict.fromkeys(words))
 
 
 def ocr_text_check(check_id, path, text_allowed, ocr=None, max_chars=3, required=True, allowed_tokens=()):
@@ -159,6 +169,11 @@ def ocr_text_check(check_id, path, text_allowed, ocr=None, max_chars=3, required
         raw = ocr(path)
     except Exception as e:
         return CheckResult(check_id, "NOT_RUN", required, "code", f"OCR failed: {e}")
+    if not text_allowed and not str(raw or "").strip():
+        return CheckResult(
+            check_id, "NOT_RUN", required, "code",
+            "OCR returned no confident words; absence of text is unverified",
+        )
     allowed = {str(t).lower() for t in allowed_tokens if len(str(t)) >= OCR_MIN_WORD}
 
     def own_lettering(tok):

@@ -353,10 +353,12 @@ class QASuiteTests(unittest.TestCase):
         self.assertEqual({c["check_id"]: c["status"] for c in r.checks}["no_text"], "NOT_RUN")
 
     def test_pass_needs_code_checks_and_every_must(self):
-        _, _, v = self.verdict(make_qa_checks(self.atoms, 1, judge_fn=self.judge_ok, ocr=lambda p: ""))
+        # Non-empty OCR output with no disallowed words verifies the no-text check;
+        # an empty OCR result is unverified and is covered by test_ocr_never_silent_pass.
+        _, _, v = self.verdict(make_qa_checks(self.atoms, 1, judge_fn=self.judge_ok, ocr=lambda p: "ok"))
         self.assertEqual(v, "PASS")
         _, _, v2 = self.verdict(make_qa_checks(self.atoms, 1, judge_fn=None, ocr=lambda p: ""))
-        self.assertEqual(v2, "UNVERIFIED")  # no judge, MUST atoms unverified
+        self.assertEqual(v2, "UNVERIFIED")  # no judge and no OCR evidence cannot pass
 
     def test_ocr_can_be_declared_not_required_but_stays_visible(self):
         r, _, v = self.verdict(make_qa_checks(self.atoms, 1, judge_fn=self.judge_ok, ocr_required=False))
@@ -374,7 +376,7 @@ class QASuiteTests(unittest.TestCase):
             judged_ids.extend(a.id for a in batch)
             return {a.id: {"pass": True, "evidence": "seen"} for a in batch}
 
-        qa = make_qa_checks(atoms, 1, judge_fn=judge, ocr=lambda p: "",
+        qa = make_qa_checks(atoms, 1, judge_fn=judge, ocr=lambda p: "ok",
                             verified_claims=offer.verified_claims)
         with tempfile.TemporaryDirectory() as d:
             receipt, _, verdict = produce_shot(
