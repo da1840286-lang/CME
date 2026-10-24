@@ -51,10 +51,10 @@ def brain_branding_rule(policy, approved_brand_marks=()):
     marks = _marks(approved_brand_marks)
     if policy == NO_BRANDING:
         return (
-            "CAMPAIGN BRANDING POLICY: no_branding. Never reproduce any logo, brand name, wordmark, model "
-            "name, label, branding emblem or readable/pseudo lettering, even when present on supplied target "
-            "photos. Preserve the target product's non-text shape, proportions, colors, materials and construction; "
-            "require clean, unmarked product surfaces. This overrides reference-photo markings."
+            "CAMPAIGN BRANDING POLICY: no_branding. Never invent text, pseudo-lettering, logos, brand names or labels. "
+            "Never reproduce those marks, even when present on supplied target-product photos. Preserve the target "
+            "product's non-text shape, proportions, colors, materials and construction; require clean, unmarked "
+            "product surfaces. This overrides reference-photo markings."
         )
     if policy == TARGET_BRAND_ALLOWED:
         allow = ("Only these explicitly approved target-brand marks may be shown: " + ", ".join(marks) + ". ") if marks else (
