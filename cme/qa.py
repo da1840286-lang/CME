@@ -230,8 +230,9 @@ def judge_batch_checks(path, atoms, judge_fn, required=False, reference_images=(
 
 
 def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr_required=True,
-                   text_allowed=False, anchors=(), verified_claims=(), product_references=(), allowed_text=()):
-    """Build QA for one shot; optional product references add a required identity comparison."""
+                   text_allowed=False, anchors=(), verified_claims=(), product_references=(), allowed_text=(),
+                   transfer_decision=None):
+    """Build QA for one shot, with independent visual checks for preserved source properties."""
     claims = [a for a in atoms if a.shot == shot and a.channel == "qa" and a.kind == "claim"]
     claim_set = {norm(c) for c in verified_claims}
     pool = [a for a in atoms if a.shot == shot and a.channel in ("image", "qa")
@@ -254,8 +255,31 @@ def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr
                 else "claim is absent from offer.verified_claims"))
         if judge_fn is not None:
             system_no_text = Atom(SYSTEM_NO_TEXT_ID, "qa_check", SYSTEM_NO_TEXT_RULE, "MUST", "qa", shot)
-            judge_rows = judge_batch_checks(path, [*pool, system_no_text], judge_fn, reference_images=product_refs)
-            res.extend(replace(row, required=True) if row.check_id == SYSTEM_NO_TEXT_ID else row for row in judge_rows)
+            judge_atoms = [*pool, system_no_text]
+            transfer_check_ids = set()
+            rows_by_id = {a.id: a for a in atoms}
+            preserved = (transfer_decision or {}).get("preserved", []) if isinstance(transfer_decision, dict) else []
+            if isinstance(preserved, list):
+                for index, item in enumerate(preserved, 1):
+                    if not isinstance(item, dict):
+                        continue
+                    carrier = rows_by_id.get(str(item.get("atom_id") or ""))
+                    prop = str(item.get("property") or "").strip()
+                    if carrier is None or carrier.shot != shot or not prop:
+                        continue
+                    check_id = f"transfer_preserved_{index}"
+                    transfer_check_ids.add(check_id)
+                    judge_atoms.append(Atom(
+                        check_id, "qa_check",
+                        "Independent transfer-preservation visual check. Source-mechanism property that must be "
+                        f"visible in this generated target-product frame: {prop}. Intended carrier atom text: "
+                        f"{carrier.text}. Judge the actual pixels, not the wording. PASS only if the stated "
+                        "property is visibly demonstrated; FAIL if the frame shows an unrelated demo or the "
+                        "property is not visually evidenced.",
+                        "MUST", "qa", shot))
+            judge_rows = judge_batch_checks(path, judge_atoms, judge_fn, reference_images=product_refs)
+            required_judge_ids = {SYSTEM_NO_TEXT_ID, *transfer_check_ids}
+            res.extend(replace(row, required=True) if row.check_id in required_judge_ids else row for row in judge_rows)
         elif product_refs:
             res.append(CheckResult(PRODUCT_IDENTITY_CHECK_ID, "NOT_RUN", True, "judge",
                                    "no Judge adapter configured; target-product identity was not compared"))

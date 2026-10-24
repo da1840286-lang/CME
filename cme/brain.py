@@ -3,7 +3,8 @@
 `call` is injected (provider-specific code lives elsewhere): call(request: dict) -> dict.
 """
 from __future__ import annotations
-from .atoms import ATOM_SCHEMA, check_claims, check_language, parse_atoms
+import re
+from .atoms import ATOM_SCHEMA, TRANSFER_ATOM_SCHEMA, check_claims, check_language, parse_atoms
 from .vertical import check_vertical
 
 
@@ -267,8 +268,136 @@ def visual_structure_errors(atoms, shots: int, links) -> dict:
     return errors
 
 
+
+# Frame budget protects the image prompt from contradictory/redundant MUST requirements.
+MAX_MUST_IMAGE_PER_SHOT = 6
+REDUNDANCY_OVERLAP = 0.75
+_STOPWORDS = frozenset("a an the of on in at to and or with without from into onto by for as is are be its it "
+                       "this that then than same visible clearly showing show shown image frame scene product target "
+                       "source shot must should may and".split())
+
+
+def _content_tokens(text) -> frozenset:
+    tokens = set()
+    for token in re.findall(r"[a-z0-9]+", str(text or "").lower()):
+        if token in _STOPWORDS or len(token) < 2:
+            continue
+        if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+            token = token[:-1]
+        tokens.add(token)
+    return frozenset(tokens)
+
+
+def _budget_row(atom) -> dict:
+    get = atom.get if isinstance(atom, dict) else (lambda key, default=None: getattr(atom, key, default))
+    return {"id": str(get("id") or ""), "kind": get("kind"), "priority": get("priority"),
+            "channel": get("channel"), "shot": get("shot"), "text": str(get("text") or "")}
+
+
+def atom_budget_errors(atoms, shots: int) -> dict:
+    """Return per-atom fixes and frame-level conflicts for redundant or over-budget MUST atoms."""
+    rows = [_budget_row(a) for a in atoms]
+    errors = {}
+    for shot in range(1, int(shots) + 1):
+        must = [r for r in rows if r["shot"] == shot and r["channel"] == "image" and r["priority"] == "MUST"]
+
+        def protected(row):
+            return row["id"].startswith(("mech_", "comp_"))
+
+        layout = [r for r in must if r["kind"] == "composition" or r["id"].startswith(("comp_", "composition"))]
+        layout.sort(key=lambda r: (not r["id"].startswith("comp_"), not r["id"].startswith("mech_")))
+        for extra in layout[1:]:
+            if not protected(extra):
+                errors[extra["id"]] = [
+                    f"FRAME_LAYOUT_CONFLICT: shot {shot} already has layout atom '{layout[0]['id']}'; one frame gets ONE "
+                    f"layout. Merge this into it or re-send '{extra['id']}' with priority='SHOULD'."
+                ]
+
+        kept = []
+        ordered = sorted((r for r in must if r["id"] not in errors), key=lambda r: not r["id"].startswith("mech_"))
+        for row in ordered:
+            tokens = _content_tokens(row["text"])
+            duplicate, best = None, 0.0
+            if len(tokens) >= 4:
+                for old, old_tokens in kept:
+                    if len(old_tokens) < 4:
+                        continue
+                    score = len(tokens & old_tokens) / min(len(tokens), len(old_tokens))
+                    if score >= REDUNDANCY_OVERLAP and score > best:
+                        duplicate, best = old["id"], score
+            if duplicate is not None and not protected(row):
+                errors[row["id"]] = [
+                    f"FRAME_REDUNDANT: '{row['id']}' repeats requirement '{duplicate}' in shot {shot}. "
+                    "Re-send it with priority='SHOULD' or describe a different visible requirement."
+                ]
+            else:
+                kept.append((row, tokens))
+
+        remaining = [r for r in must if r["id"] not in errors]
+        if len(remaining) > MAX_MUST_IMAGE_PER_SHOT:
+            errors[f"#must_budget_{shot}"] = [
+                f"FRAME_BUDGET: shot {shot} has {len(remaining)} MUST image atoms "
+                f"(limit {MAX_MUST_IMAGE_PER_SHOT}). Re-send the least essential ones with priority='SHOULD'; "
+                "keep the mechanism and target-product requirements."
+            ]
+    return errors
+
+
+class TransferRejected(BrainError):
+    """The source mechanism cannot be shown honestly with the selected target product."""
+
+    def __init__(self, decision: dict):
+        self.decision = dict(decision or {})
+        super().__init__({"#transfer": [f"TRANSFER_REJECTED: {self.decision.get('reason', '')}"]})
+
+
+_CYRILLIC = re.compile("[\\u0400-\\u04ff]")
+
+
+def validate_transfer_decision(decision, atoms) -> list:
+    """Validate the decision and require every preserved property to have a MUST image carrier."""
+    if not isinstance(decision, dict):
+        return ["transfer_decision is required when source_transfer is supplied"]
+    errors = []
+    if type(decision.get("transferable")) is not bool:
+        errors.append("transfer_decision.transferable must be true or false")
+    reason = decision.get("reason")
+    if not isinstance(reason, str) or len(reason.strip()) < 10:
+        errors.append("transfer_decision.reason must explain the decision (at least 10 characters)")
+    for key in ("abstract_mechanism", "reason"):
+        value = decision.get(key)
+        if isinstance(value, str) and _CYRILLIC.search(value):
+            errors.append(f"transfer_decision.{key} must be in English")
+    if decision.get("transferable") is True:
+        mechanism = decision.get("abstract_mechanism")
+        if not isinstance(mechanism, str) or len(mechanism.strip()) < 10:
+            errors.append("transfer_decision.abstract_mechanism must state the brand-free causal idea (at least 10 characters)")
+        preserved = decision.get("preserved")
+        if not isinstance(preserved, list) or not 1 <= len(preserved) <= 4:
+            errors.append("transfer_decision.preserved must list 1-4 source properties that stay visible")
+        else:
+            by_id = {}
+            for atom in atoms or []:
+                aid, priority, channel, kind = _atom_view(atom)
+                by_id[aid] = (priority, channel, kind)
+            for index, item in enumerate(preserved):
+                if not isinstance(item, dict):
+                    errors.append(f"transfer_decision.preserved[{index}] must be an object")
+                    continue
+                prop = item.get("property")
+                if not isinstance(prop, str) or len(prop.strip()) < 8:
+                    errors.append(f"transfer_decision.preserved[{index}].property must describe the preserved property")
+                    continue
+                carrier = by_id.get(str(item.get("atom_id") or ""))
+                if carrier is None or carrier[0] != "MUST" or carrier[1] != "image" or carrier[2] == "claim":
+                    errors.append(
+                        f"transfer_decision.preserved[{index}].atom_id must name an existing MUST image atom "
+                        f"that carries '{prop[:60]}'")
+    return errors
+
+
 def build_request(offer, brief: str, shots: int, failed=None, source_transfer=None) -> dict:
-    req = {"schema": ATOM_SCHEMA, "offer": offer.to_dict(), "brief": brief, "shots": shots,
+    req = {"schema": TRANSFER_ATOM_SCHEMA if source_transfer else ATOM_SCHEMA, "offer": offer.to_dict(), "brief": brief, "shots": shots,
            "rules": ["Return atoms only, no finished prompts.",
                      "Every kind='claim' atom must copy one verified claim verbatim and use channel='qa'; it records offer truth, not pixels.",
                      "Never put kind='claim' atoms in channel='image'. If visible proof is needed, create a separate image atom of kind product/action/scene that describes an observable cue, such as a close-up of the zip closure visibly shut.",
@@ -278,7 +407,8 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
                      "Never invent text, pseudo-lettering, logos, brand names or labels. Reproduce them only when present in supplied product assets or explicitly specified by the offer/brief.",
                      "Never use a forbidden claim.",
                      "When target-product reference photos are supplied, preserve the actual target product's form factor, silhouette, proportions, and distinctive visible parts. Keep the target product body recognizable in the frame; do not substitute a generic lookalike or change a compact handheld product into an upright/stick device.",
-                     "Write every atom text in English, even when the input context is in another language. Translate the source statements; never copy non-English words into atoms."]}
+                     "Write every atom text in English, even when the input context is in another language. Translate the source statements; never copy non-English words into atoms.",
+                     "Frame budget: at most %d MUST image atoms per shot; use only one layout atom per shot; do not repeat the same visible requirement in a scene, action and mechanism atom. The mech_* atom carries the idea; other atoms add only distinct requirements." % MAX_MUST_IMAGE_PER_SHOT]}
     if source_transfer:
         req["source_transfer"] = source_transfer
         links = derive_mechanism_links(source_transfer)
@@ -305,20 +435,34 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
             "When a MUST image atom depicts an intervention result or before/after delta, define a visibly checkable contrast in the same frame: specify where the untreated/dirty side and treated/clean side are located (for example, left/right); keep the intervention tool/action at their visible boundary; make the cleaned result a substantial, unobstructed debris-free strip that is not hidden under the tool. Avoid relying only on phrases like 'completely clean' without describing the visible boundary and changed area.",
             "The source's commercial metrics or reasoning-confidence values are not proof that the mechanism is profitable for the target offer.",
         ])
+        req["rules"].append(
+            "TRANSFER DECISION (required): decide whether the source's causal mechanism can be demonstrated honestly "
+            "by the TARGET product. Return transfer_decision {transferable, abstract_mechanism, preserved, reason} "
+            "beside atoms. abstract_mechanism is the brand-free causal idea. If the target cannot demonstrate it without "
+            "inventing features, or the mechanism becomes an unrelated ordinary target-product demo, set transferable=false, "
+            "explain why, and return atoms=[]. If true, preserved lists 1-4 {property, atom_id} entries linking source "
+            "properties to existing MUST image atoms. English only."
+        )
     if failed:
         req["only_fix"] = failed  # [{id, errors, previous_text}]
     return req
 
 
-def request_atoms(offer, brief: str, shots: int, call, max_retries: int = 2, vertical=None, source_transfer=None) -> list:
+def request_atoms(offer, brief: str, shots: int, call, max_retries: int = 2, vertical=None, source_transfer=None, decision_out=None) -> list:
     """Retry only what failed. An id's error clears only when that id arrives valid in a later round."""
     by_id: dict = {}
     pending: dict = {}
     failed = None
     required_links = derive_mechanism_links(source_transfer)
+    held_decision = None
     for _ in range(max_retries + 1):
         resp = call(build_request(offer, brief, shots, failed, source_transfer=source_transfer))
-        raw = resp.get("atoms", [])
+        offered = resp.get("transfer_decision") if isinstance(resp, dict) else None
+        if source_transfer and isinstance(offered, dict) and offered.get("transferable") is False:
+            rejection_errors = validate_transfer_decision(offered, [])
+            if not rejection_errors:
+                raise TransferRejected(offered)
+        raw = resp.get("atoms", []) if isinstance(resp, dict) else []
         parsed = parse_atoms(raw)
         round_errs = {k: list(v) for k, v in parsed.errors.items()}
         for atom in parsed.atoms:
@@ -351,16 +495,29 @@ def request_atoms(offer, brief: str, shots: int, call, max_retries: int = 2, ver
                 pending[f"#shot_{k}"] = [f"shot {k} has no MUST image atom"]
         for name in missing_mechanism_links(by_id.values(), required_links):
             pending[f"#mechanism_{name}"] = [f"mechanism link '{name}' has no MUST image atom with id prefix mech_{name}_"]
-        structure_errors = visual_structure_errors(by_id.values(), shots, required_links)
+        structure_errors = {**visual_structure_errors(by_id.values(), shots, required_links),
+                            **atom_budget_errors(by_id.values(), shots)}
         pending.update(structure_errors)
         for aid in list(structure_errors):
             if not aid.startswith("#"):
                 by_id.pop(aid, None)
         for name in missing_mechanism_links(by_id.values(), required_links):
             pending[f"#mechanism_{name}"] = [f"mechanism link '{name}' has no MUST image atom with id prefix mech_{name}_"]
-        structure_errors = visual_structure_errors(by_id.values(), shots, required_links)
+        structure_errors = {**visual_structure_errors(by_id.values(), shots, required_links),
+                            **atom_budget_errors(by_id.values(), shots)}
         pending.update(structure_errors)
+        if source_transfer:
+            candidate_decision = offered if isinstance(offered, dict) else held_decision
+            decision_errors = validate_transfer_decision(candidate_decision, by_id.values())
+            if decision_errors:
+                pending["#transfer_decision"] = decision_errors
+                held_decision = None
+            else:
+                held_decision = candidate_decision
         if not pending:
+            if isinstance(decision_out, dict) and held_decision is not None:
+                decision_out.clear()
+                decision_out.update(held_decision)
             return list(by_id.values())
         prev_text = {i["id"]: i.get("text", "") for i in raw if isinstance(i, dict) and i.get("id")}
         failed = [{"id": k, "errors": v, "previous_text": prev_text.get(k, "")} for k, v in pending.items()]

@@ -14,8 +14,9 @@ import sys
 import time
 from pathlib import Path
 from .atoms import check_claims, check_language, parse_atoms
-from .brain import (BrainError, build_source_transfer_context, derive_mechanism_links, missing_mechanism_links,
-                    reserved_system_atom_errors, visual_structure_errors, request_atoms)
+from .brain import (BrainError, TransferRejected, atom_budget_errors, build_source_transfer_context,
+                    derive_mechanism_links, missing_mechanism_links, reserved_system_atom_errors,
+                    validate_transfer_decision, visual_structure_errors, request_atoms)
 from .compiler import BudgetError
 from .offer import OfferError, load_offer
 from .providers import CallLog, InfraError, ProviderCallError, ProviderPolicyError
@@ -80,6 +81,17 @@ def validate_atoms_manifest(atoms_path, manifest_path, atoms_json, offer, shot=N
     if type(requested) is int and any(type(a.get("shot")) is not int or a["shot"] > requested
                                       for a in atoms_json if isinstance(a, dict)):
         errors["#atoms"] = ["atoms contain a shot outside the Brain contract's requested range"]
+    decision = manifest.get("transfer_decision")
+    if manifest.get("source_contract_sha256"):
+        if not isinstance(decision, dict) or decision.get("transferable") is not True:
+            errors["#transfer_decision"] = ["source-bound manifest must contain transfer_decision.transferable=true"]
+        decision_errors = validate_transfer_decision(decision, atoms_json)
+        if decision_errors:
+            errors["#transfer_decision"] = decision_errors
+    elif decision is not None:
+        decision_errors = validate_transfer_decision(decision, atoms_json)
+        if decision_errors:
+            errors["#transfer_decision"] = decision_errors
     links = manifest.get("mechanism_links") or []
     lost_links = missing_mechanism_links(atoms_json, links)
     if lost_links:
@@ -87,6 +99,7 @@ def validate_atoms_manifest(atoms_path, manifest_path, atoms_json, offer, shot=N
     errors.update(reserved_system_atom_errors(atoms_json))
     if type(requested) is int and requested >= 1:
         errors.update(visual_structure_errors(atoms_json, requested, links))
+        errors.update(atom_budget_errors(atoms_json, requested))
     if errors:
         raise BrainError(errors)
     return manifest
@@ -137,7 +150,9 @@ def run_brain(args, offer, settings, catalog, vertical, log, run_id, ctx, out):
     manifest_path.unlink(missing_ok=True)
     atoms_path.unlink(missing_ok=True)
     call = make_brain_call(settings, catalog, log, run_id, **ctx)
-    atoms = request_atoms(offer, args.brief, args.shots, call, vertical=vertical, source_transfer=source_transfer)
+    transfer_decision = {}
+    atoms = request_atoms(offer, args.brief, args.shots, call, vertical=vertical,
+                          source_transfer=source_transfer, decision_out=transfer_decision)
     data = [a.to_dict() for a in atoms]
     atoms_path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     fingerprint, photo_hashes = offer_fingerprint(offer)
@@ -149,6 +164,8 @@ def run_brain(args, offer, settings, catalog, vertical, log, run_id, ctx, out):
                 "brief_sha256": _sha256_bytes(args.brief.encode("utf-8")),
                 "source_contract_sha256": _sha256_bytes(Path(args.source_contract).read_bytes()) if args.source_contract else None,
                 "model_id": call.info.get("model_id"), "responded_model": call.info.get("responded_model")}
+    if transfer_decision:
+        manifest["transfer_decision"] = transfer_decision
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"Brain: {len(atoms)} атомов, модель {call.info.get('model_id')} (ответила: {call.info.get('responded_model') or 'не сообщено'})")
     print(atoms_summary(atoms))
@@ -190,9 +207,17 @@ def run_frame(args, offer, settings, catalog, vertical, log, run_id, ctx, out, a
         image_seed = image_seed_for_attempt(image_spec.params.get("seed", 0), args.attempt, contract_id)
     provider = make_image_provider(settings, catalog, log, run_id, image_seed=image_seed, **ctx)
     judge = make_judge(settings, catalog, log, run_id, **ctx) if settings.judge_adapter else None
+    transfer_decision = None
+    manifest_path = out / "atoms_manifest.json"
+    if atom_provenance == "verified_manifest" and manifest_path.is_file():
+        try:
+            transfer_decision = json.loads(manifest_path.read_text(encoding="utf-8")).get("transfer_decision")
+        except (OSError, ValueError):
+            transfer_decision = None
     qa = make_qa_checks(atoms, args.shot, judge_fn=judge, ocr_required=not args.no_ocr_required,
                         verified_claims=offer.verified_claims, product_references=offer.photos,
-                        allowed_text=brand_tokens(offer.name, offer.product_type))
+                        allowed_text=brand_tokens(offer.name, offer.product_type),
+                        transfer_decision=transfer_decision)
     refs = [state.shots[args.shot - 1]["image_path"]] if (args.shot - 1) in state.shots else []
     try:
         receipt, compiled, verdict = produce_shot(
@@ -289,11 +314,16 @@ def main(argv=None, ctx=None) -> int:
         print(message); write_run_result(out,args.command,2,"INFRASTRUCTURE_ERROR",message); return 2
     except (GateError, BudgetError, AttemptLimit, ProviderPolicyError, StateMismatch, OfferError) as e:
         message=f"Остановлено до платного вызова или политикой: {e}"; print(message); write_run_result(out,args.command,3,"CONTRACT_OR_PREFLIGHT_BLOCKED",message); return 3
+    except TransferRejected as e:
+        message = f"TRANSFER_REJECTED: source mechanism cannot be transferred to this target product: {e.decision.get('reason', '')}"
+        print(message)
+        write_run_result(out, args.command, 4, "TRANSFER_REJECTED", message)
+        return 4
     except BrainError as e:
         message=f"Brain не вернул валидные атомы: {e.errors}"; print(message)
         error_text=json.dumps(e.errors,ensure_ascii=False)
-        failure_class=("VISUAL_CONTRACT_INVALID" if any(t in error_text for t in ("COMPOSITION_REQUIRED","MECHANISM_SHOT_ORDER","SYSTEM_OWNED_QA")) else "BRAIN_OUTPUT_INVALID")
-        write_run_result(out,args.command,4,failure_class,message); return 4
+        failure_class=("VISUAL_CONTRACT_INVALID" if any(t in error_text for t in ("COMPOSITION_REQUIRED","MECHANISM_SHOT_ORDER","SYSTEM_OWNED_QA","transfer_decision")) else "BRAIN_OUTPUT_INVALID")
+        write_run_result(out,args.command,4,failure_class,message)
     except ProviderCallError as e:
         message=f"Провайдер ответил ошибкой: {e}"; print(message); write_run_result(out,args.command,5,"PROVIDER_RESPONSE_ERROR",message); return 5
     if args.command == "brain":
