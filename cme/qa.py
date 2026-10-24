@@ -5,14 +5,20 @@ atom verified. For image atoms (b) can only come from the Judge, so in practice 
 code guards the frame itself (decodes, not blank, no stray text). The Judge alone cannot produce PASS.
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from collections.abc import Sequence
 from PIL import Image, ImageChops, ImageStat
-from .atoms import norm
+from .atoms import Atom, norm
 
 
 PRODUCT_IDENTITY_CHECK_ID = "cme_product_identity_ref"
+SYSTEM_NO_TEXT_ID = "system_no_text_policy"
+SYSTEM_NO_TEXT_RULE = (
+    "No added text overlays, captions, subtitles, UI, watermarks, or promotional wording. "
+    "Lettering physically printed on the target product itself is product-native, not an overlay; "
+    "when target-product references are supplied, its markings must be consistent with them."
+)
 MAX_PRODUCT_REFERENCES_FOR_JUDGE = 3
 
 
@@ -229,7 +235,8 @@ def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr
     claims = [a for a in atoms if a.shot == shot and a.channel == "qa" and a.kind == "claim"]
     claim_set = {norm(c) for c in verified_claims}
     pool = [a for a in atoms if a.shot == shot and a.channel in ("image", "qa")
-            and not (a.channel == "qa" and a.kind == "claim")]
+            and not (a.channel == "qa" and a.kind == "claim")
+            and a.id != "qa_no_text" and not a.id.startswith("qa_no_text_")]
     product_refs = tuple(str(p) for p in list(product_references or ())[:MAX_PRODUCT_REFERENCES_FOR_JUDGE])
 
     def run(path):
@@ -245,8 +252,10 @@ def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr
                 a.id, "PASS" if valid else "FAIL", a.priority == "MUST", "code",
                 "matches verified offer claim; not inferred from pixels" if valid
                 else "claim is absent from offer.verified_claims"))
-        if judge_fn is not None and (pool or product_refs):
-            res.extend(judge_batch_checks(path, pool, judge_fn, reference_images=product_refs))
+        if judge_fn is not None:
+            system_no_text = Atom(SYSTEM_NO_TEXT_ID, "qa_check", SYSTEM_NO_TEXT_RULE, "MUST", "qa", shot)
+            judge_rows = judge_batch_checks(path, [*pool, system_no_text], judge_fn, reference_images=product_refs)
+            res.extend(replace(row, required=True) if row.check_id == SYSTEM_NO_TEXT_ID else row for row in judge_rows)
         elif product_refs:
             res.append(CheckResult(PRODUCT_IDENTITY_CHECK_ID, "NOT_RUN", True, "judge",
                                    "no Judge adapter configured; target-product identity was not compared"))

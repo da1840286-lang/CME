@@ -74,6 +74,18 @@ on:
         type: number
         required: true
         default: 1
+      shot:
+        description: "For frame stage: shot number to generate from the accepted Brain contract (1-6)"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
+          - "6"
+        required: true
+        default: "1"
       brief:
         description: "Target-native production brief; source mechanism is carried separately from source_contract_json"
         type: string
@@ -123,6 +135,7 @@ jobs:
       FIND_MAX_ADS: ${{ inputs.find_max_ads }}
       FIND_KEYWORDS: ${{ inputs.keywords }}
       SHOTS: ${{ inputs.shots }}
+      CME_SHOT: ${{ inputs.shot }}
       BRAIN_RUN_ID: ${{ inputs.brain_run_id }}
       PREVIOUS_FRAME_RUN_ID: ${{ inputs.previous_frame_run_id }}
       NO_OCR_REQUIRED: ${{ inputs.no_ocr_required }}
@@ -274,8 +287,12 @@ jobs:
               [[ -n "${OPENROUTER_API_KEY:-}" ]] || { echo "::error::Add OPENROUTER_API_KEY (Judge) in Actions secrets."; exit 1; }
               [[ -n "${HF_TOKEN:-}" ]] || { echo "::error::Add HF_TOKEN (Hugging Face) in Actions secrets."; exit 1; }
               [[ "$BRAIN_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::For frame, enter the numeric run ID from successful Brain."; exit 1; }
+              [[ "$CME_SHOT" =~ ^[1-6]$ ]] || { echo "::error::shot must be 1..6."; exit 1; }
               if [[ -n "$PREVIOUS_FRAME_RUN_ID" && ! "$PREVIOUS_FRAME_RUN_ID" =~ ^[0-9]+$ ]]; then
                 echo "::error::previous_frame_run_id must be numeric."; exit 1
+              fi
+              if [[ "$CME_SHOT" -gt 1 && -z "$PREVIOUS_FRAME_RUN_ID" ]]; then
+                echo "::error::shot 2+ requires previous_frame_run_id from a successful frame run."; exit 1
               fi
               ;;
             all)
@@ -331,7 +348,7 @@ jobs:
               check_run(os.environ["BRAIN_RUN_ID"], "cme-brain-out", True)
               prior = os.environ.get("PREVIOUS_FRAME_RUN_ID", "").strip()
               if prior:
-                  check_run(prior, "cme-frame-out", False)
+                  check_run(prior, "cme-frame-out", int(os.environ.get("CME_SHOT", "1")) > 1)
           elif os.environ["CME_STAGE"] == "analyze":
               # FIND is data input, not a compiled contract: permit an earlier commit on
               # the same branch so the current run can analyse an already-paid-for search.
@@ -401,7 +418,7 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import json
+          import json, os
           from pathlib import Path
           from cme.offer import load_offer
           from cme.qa import validate_product_references
@@ -416,7 +433,9 @@ jobs:
           if issues:
               raise SystemExit("Target-product photo preflight blocked generation: " + "; ".join(issues))
           data = json.loads(atoms_path.read_text(encoding="utf-8"))
-          manifest = validate_atoms_manifest(atoms_path, manifest_path, data, offer, shot=1)
+          dispatch_inputs = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8")).get("inputs") or {}
+          requested_shot = int(dispatch_inputs.get("shot") or 1)
+          manifest = validate_atoms_manifest(atoms_path, manifest_path, data, offer, shot=requested_shot)
           print(f"Frame preflight PASS: offer={offer.offer_id}; contract={manifest['contract_id']}; target photos verified.")
           PY
 
@@ -771,10 +790,26 @@ jobs:
               calls = work / "calls.jsonl"
               if calls.is_file():
                   shutil.copy2(calls, out / "radar-analysis-calls.jsonl")
+              verdict_values = report.get("verdicts", []) or []
+              verdict_text = json.dumps(verdict_values, ensure_ascii=False).upper()
+              status_text = str(report.get("status", "")).upper()
+              if status_text == "OK" and report.get("exit_code") == 0:
+                  failure_class = "DELIVERED_PASS"
+              elif "UNVERIFIED" in verdict_text or status_text == "UNVERIFIED":
+                  failure_class = "QA_UNVERIFIED"
+              elif "NOT_DELIVERED" in verdict_text or status_text == "NOT_DELIVERED":
+                  failure_class = "NOT_DELIVERED"
+              elif "FAILED_QA" in verdict_text or status_text == "FAILED_QA":
+                  failure_class = "VISUAL_QA_FAILED"
+              elif status_text in {"API_ERROR", "PROVIDER_ERROR", "INFRA_ERROR"}:
+                  failure_class = "INFRASTRUCTURE_OR_PROVIDER_ERROR"
+              else:
+                  failure_class = "PRODUCTION_OR_CONTRACT_ERROR"
               brief = {"status": report.get("status"), "run_id": report.get("run_id"), "candidate_id": cid,
                        "selection_mode": selection_mode, "analysis_id": status.get("analysis_id"), "exit_code": report.get("exit_code"),
+                       "failure_class": failure_class,
                        "offer_name": report.get("offer_name"), "images": report.get("images", []),
-                       "verdicts": report.get("verdicts", []), "provider_calls_made": report.get("provider_calls_made", 0),
+                       "verdicts": verdict_values, "provider_calls_made": report.get("provider_calls_made", 0),
                        "stdout_tail": report.get("stdout_tail", ""), "stderr_tail": report.get("stderr_tail", "")}
               (out / "live_result.json").write_text(json.dumps(brief, ensure_ascii=False, indent=2), encoding="utf-8")
               print(json.dumps(brief, ensure_ascii=False, indent=2))
@@ -793,15 +828,16 @@ jobs:
             attempt=1
             if [[ -s out/state.json ]]; then
               attempt="$(python - <<'PY'
-          import json
+          import json, os
           from pathlib import Path
           state = json.loads(Path("out/state.json").read_text(encoding="utf-8"))
-          used = sum(1 for item in state.get("attempts", []) if item.get("shot") == 1 and item.get("receipt_id"))
+          requested_shot = int(os.environ.get("CME_SHOT", "1"))
+          used = sum(1 for item in state.get("attempts", []) if item.get("shot") == requested_shot and item.get("receipt_id"))
           print(used + 1)
           PY
               )"
             fi
-            args=(python -m cme.smoke frame --offer out/live_offer.json --out out --attempt "$attempt")
+            args=(python -m cme.smoke frame --offer out/live_offer.json --out out --shot "$CME_SHOT" --attempt "$attempt")
             if [[ "$NO_OCR_REQUIRED" == "true" ]]; then
               args+=(--no-ocr-required)
             fi

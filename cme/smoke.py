@@ -14,7 +14,8 @@ import sys
 import time
 from pathlib import Path
 from .atoms import check_claims, check_language, parse_atoms
-from .brain import BrainError, build_source_transfer_context, derive_mechanism_links, missing_mechanism_links, request_atoms
+from .brain import (BrainError, build_source_transfer_context, derive_mechanism_links, missing_mechanism_links,
+                    reserved_system_atom_errors, visual_structure_errors, request_atoms)
 from .compiler import BudgetError
 from .offer import OfferError, load_offer
 from .providers import CallLog, InfraError, ProviderCallError, ProviderPolicyError
@@ -79,9 +80,13 @@ def validate_atoms_manifest(atoms_path, manifest_path, atoms_json, offer, shot=N
     if type(requested) is int and any(type(a.get("shot")) is not int or a["shot"] > requested
                                       for a in atoms_json if isinstance(a, dict)):
         errors["#atoms"] = ["atoms contain a shot outside the Brain contract's requested range"]
-    lost_links = missing_mechanism_links(atoms_json, manifest.get("mechanism_links") or [])
+    links = manifest.get("mechanism_links") or []
+    lost_links = missing_mechanism_links(atoms_json, links)
     if lost_links:
         errors["#mechanism"] = [f"mechanism link '{n}' is no longer carried by a MUST atom" for n in lost_links]
+    errors.update(reserved_system_atom_errors(atoms_json))
+    if type(requested) is int and requested >= 1:
+        errors.update(visual_structure_errors(atoms_json, requested, links))
     if errors:
         raise BrainError(errors)
     return manifest
@@ -92,6 +97,14 @@ def atoms_summary(atoms) -> str:
     for a in atoms:
         rows.setdefault((a.shot, a.channel), {"MUST": 0, "SHOULD": 0, "MAY": 0})[a.priority] += 1
     return "\n".join(f"  shot {s} / {c}: " + ", ".join(f"{k}={v}" for k, v in d.items()) for (s, c), d in sorted(rows.items()))
+
+
+def write_run_result(out: Path, command: str, exit_code: int, failure_class: str, message: str, verdict=None) -> None:
+    """Write diagnostic classification without changing the workflow's established exit codes."""
+    payload = {"command": command, "exit_code": exit_code, "failure_class": failure_class, "status": "OK" if exit_code == 0 else "ERROR", "message": str(message or "")[:1000]}
+    if verdict: payload["verdict"] = verdict
+    try: (Path(out) / "run_result.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc: print(f"Не удалось записать run_result.json: {exc}")
 
 
 def image_seed_for_attempt(base_seed: int, attempt: int, contract_id: str) -> int:
@@ -252,7 +265,7 @@ def main(argv=None, ctx=None) -> int:
                 args.shot = shot_number
                 frame_run_id = args.run_id if shot_number == 1 else f"{args.run_id}-s{shot_number:02d}"
                 # Retry only rejected/undelivered frames; UNVERIFIED is a checker failure, not a frame failure.
-                tries = max(1, int(settings.max_attempts_per_shot or 1)) if args.command == "all" else 1
+                tries = min(2, max(1, int(settings.max_attempts_per_shot or 1))) if args.command == "all" else 1
                 for attempt_number in range(1, tries + 1):
                     args.attempt = attempt_number
                     verdict = run_frame(args, offer, settings, catalog, vertical, log, frame_run_id, ctx, out, data, atom_provenance)
@@ -260,27 +273,33 @@ def main(argv=None, ctx=None) -> int:
                         break
                     print(f"Кадр {shot_number}: попытка {attempt_number} не прошла QA ({verdict}); новая попытка с другим seed.")
                 if verdict == "UNVERIFIED":
+                    write_run_result(out, args.command, 6, "QA_UNVERIFIED", "Required QA checks did not produce a verifiable verdict.", verdict)
                     return 6
                 if verdict in ("FAILED_QA", "NOT_DELIVERED"):
+                    failure_class = "NOT_DELIVERED" if verdict == "NOT_DELIVERED" else "VISUAL_QA_FAILED"
+                    write_run_result(out, args.command, 7, failure_class, "A required MUST condition was not delivered or did not pass QA.", verdict)
                     return 7
     except FileNotFoundError as e:
-        print(f"Не найден файл: {e.filename}. Скопируйте settings.example.json в settings.json и поправьте его.")
-        return 3
+        message = f"Не найден файл: {e.filename}. Скопируйте settings.example.json в settings.json и поправьте его."
+        print(message); write_run_result(out,args.command,3,"SETUP_OR_FILE_ERROR",message); return 3
     except SettingsError as e:
-        print(f"Ошибка настроек: {e}")
-        return 3
+        message=f"Ошибка настроек: {e}"; print(message); write_run_result(out,args.command,3,"SETTINGS_ERROR",message); return 3
     except InfraError as e:
-        print(f"Сбой инфраструктуры (квота, лимит, сеть): {e}\nЗапись попытки сохранена в {out}. Повторите позже или объявите fallback.")
-        return 2
+        message=f"Сбой инфраструктуры (квота, лимит, сеть): {e}\nЗапись попытки сохранена в {out}. Повторите позже или объявите fallback."
+        print(message); write_run_result(out,args.command,2,"INFRASTRUCTURE_ERROR",message); return 2
     except (GateError, BudgetError, AttemptLimit, ProviderPolicyError, StateMismatch, OfferError) as e:
-        print(f"Остановлено до платного вызова или политикой: {e}")
-        return 3
+        message=f"Остановлено до платного вызова или политикой: {e}"; print(message); write_run_result(out,args.command,3,"CONTRACT_OR_PREFLIGHT_BLOCKED",message); return 3
     except BrainError as e:
-        print(f"Brain не вернул валидные атомы: {e.errors}")
-        return 4
+        message=f"Brain не вернул валидные атомы: {e.errors}"; print(message)
+        error_text=json.dumps(e.errors,ensure_ascii=False)
+        failure_class=("VISUAL_CONTRACT_INVALID" if any(t in error_text for t in ("COMPOSITION_REQUIRED","MECHANISM_SHOT_ORDER","SYSTEM_OWNED_QA")) else "BRAIN_OUTPUT_INVALID")
+        write_run_result(out,args.command,4,failure_class,message); return 4
     except ProviderCallError as e:
-        print(f"Провайдер ответил ошибкой: {e}")
-        return 5
+        message=f"Провайдер ответил ошибкой: {e}"; print(message); write_run_result(out,args.command,5,"PROVIDER_RESPONSE_ERROR",message); return 5
+    if args.command == "brain":
+        write_run_result(out,args.command,0,"BRAIN_CONTRACT_READY","Brain contract and manifest passed validation.")
+    else:
+        write_run_result(out,args.command,0,"DELIVERED_PASS","All requested frames passed the configured delivery and QA gates.","PASS")
     return 0
 
 

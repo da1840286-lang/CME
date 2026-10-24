@@ -122,6 +122,13 @@ class FrameRetryTests(unittest.TestCase):
             self.assertEqual(code, 7)
             self.assertEqual(len(list((out / "shots").glob("shot_01_a*.png"))), 1)
 
+    def test_configured_retry_limit_above_two_is_still_capped_at_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = self.run_all(tmp, fail_calls=99, max_attempts_per_shot=5)
+            self.assertEqual(code, 7)
+            self.assertEqual(len(list((out / "shots").glob("shot_01_a*.png"))), 2)
+            self.assertFalse(list((out / "shots").glob("shot_01_a03.png")))
+
     def test_a_passing_frame_is_never_regenerated(self):
         with tempfile.TemporaryDirectory() as tmp:
             code, out = self.run_all(tmp, fail_calls=0)

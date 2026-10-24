@@ -78,13 +78,14 @@ class AtomTests(unittest.TestCase):
         self.assertEqual(parsed.errors, {})
         self.assertEqual(compile_image_prompt(parsed.atoms, 1).text, "A kitchen counter")
 
-    def test_brain_qa_rules_allow_reference_native_branding(self):
+    def test_brain_does_not_author_system_owned_no_text_check(self):
         request = build_request(load_offer(EX), "brief", 1)
         rules = " ".join(request["rules"])
         self.assertIn("kind='qa_check'", rules)
         self.assertIn("channel='qa'", rules)
-        self.assertIn("native logos", rules)
-        self.assertIn("supplied target-product reference", rules)
+        self.assertIn("qa_no_text", rules)
+        self.assertIn("injected and checked by code", rules)
+        self.assertNotIn("allow native logos", rules)
 
     def test_target_product_form_factor_is_preserved(self):
         request = build_request(load_offer(EX), "brief", 1)

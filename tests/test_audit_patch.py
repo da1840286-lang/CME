@@ -34,7 +34,8 @@ RADAR = {"result": {
     "transferability": {"text": "Works for other cleaning tools", "kind": "INFERRED"}}}
 FULL = [atom("mech_problem_seat", "Crumbs packed into a seat gap"),
         atom("mech_intervention_nozzle", "Compact vacuum nozzle pulling crumbs from the gap"),
-        atom("mech_result_clean", "The same seat gap now visibly clean")]
+        atom("mech_result_clean", "The same seat gap now visibly clean"),
+        atom("comp_split_1", "One-frame comparison layout with separate problem and result regions", kind="scene")]
 
 
 class LanguageTests(unittest.TestCase):
@@ -130,7 +131,7 @@ class MechanismCoverageTests(unittest.TestCase):
         atoms = request_atoms(offer, "b", 1, call, source_transfer=ctx)
         self.assertEqual(missing_mechanism_links(atoms, ["problem", "intervention", "result"]), [])
         fix_ids = {f["id"] for f in calls[1]["only_fix"]}
-        self.assertEqual(fix_ids, {"#mechanism_intervention", "#mechanism_result"})
+        self.assertEqual(fix_ids, {"#mechanism_intervention", "#mechanism_result", "#composition"})
 
     def test_brain_fails_closed_when_a_link_is_never_carried(self):
         with self.assertRaises(BrainError) as cm:

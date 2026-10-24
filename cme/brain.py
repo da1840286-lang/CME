@@ -225,6 +225,48 @@ def missing_mechanism_links(atoms, links) -> list:
     return missing
 
 
+def reserved_system_atom_errors(atoms) -> dict:
+    """Brain must not author a no-text criterion; QA injects the canonical system rule."""
+    errors = {}
+    for atom in atoms:
+        aid, _priority, _channel, _kind = _atom_view(atom)
+        if str(aid) == "qa_no_text" or str(aid).startswith("qa_no_text_"):
+            errors[str(aid)] = ["SYSTEM_OWNED_QA: do not author qa_no_text atoms; the canonical no-text check is injected by code"]
+    return errors
+
+
+def visual_structure_errors(atoms, shots: int, links) -> dict:
+    """Deterministic visual-contract checks; this is structural validation, not semantic vision."""
+    rows = []
+    for atom in atoms:
+        get = atom.get if isinstance(atom, dict) else (lambda key, default=None: getattr(atom, key, default))
+        rows.append({"id": str(get("id") or ""), "kind": get("kind"), "priority": get("priority"), "channel": get("channel"), "shot": get("shot")})
+    names = {str(link.get("link") if isinstance(link, dict) else link) for link in (links or [])}
+    errors = {}
+    for row in rows:
+        if row["id"].startswith("comp_") and not (
+            row["kind"] == "scene" and row["channel"] == "image" and row["priority"] == "MUST"
+            and type(row["shot"]) is int and 1 <= row["shot"] <= shots
+        ):
+            errors[row["id"]] = ["COMPOSITION_ATOM_SHAPE: atoms with id prefix comp_ must be kind=scene, channel=image, priority=MUST, and assigned to a requested shot"]
+    if shots == 1 and {"problem", "result"}.issubset(names):
+        comp = [r for r in rows if r["id"].startswith("comp_") and r["kind"] == "scene" and r["channel"] == "image" and r["priority"] == "MUST" and r["shot"] == 1]
+        if not comp:
+            errors["#composition"] = ["COMPOSITION_REQUIRED: shots=1 with problem+result mechanism links requires a MUST image scene atom for shot 1 whose id starts with comp_; describe an achievable layout and visible before/result regions"]
+    if shots >= 2:
+        expected_shot = {"problem": 1, "intervention": 1, "result": 2}
+        for name in sorted(names.intersection(expected_shot)):
+            expected = expected_shot[name]
+            prefix = f"mech_{name}_"
+            matching = [r for r in rows if r["id"].startswith(prefix) and r["kind"] != "claim" and r["priority"] == "MUST" and r["channel"] == "image"]
+            if not any(r["shot"] == expected for r in matching):
+                errors[f"#mechanism_shot_{name}"] = [f"MECHANISM_SHOT_ORDER: required MUST image link '{name}' must be assigned to shot {expected}"]
+            for row in matching:
+                if row["shot"] != expected:
+                    errors[row["id"]] = [f"MECHANISM_SHOT_ORDER: atom '{row['id']}' carries link '{name}' but is in shot {row['shot']}; assign it to shot {expected}"]
+    return errors
+
+
 def build_request(offer, brief: str, shots: int, failed=None, source_transfer=None) -> dict:
     req = {"schema": ATOM_SCHEMA, "offer": offer.to_dict(), "brief": brief, "shots": shots,
            "rules": ["Return atoms only, no finished prompts.",
@@ -232,7 +274,7 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
                      "Never put kind='claim' atoms in channel='image'. If visible proof is needed, create a separate image atom of kind product/action/scene that describes an observable cue, such as a close-up of the zip closure visibly shut.",
                      "Do not treat abstract care or durability claims as visually verifiable from a generic still. Ask for a visible label only when the brief explicitly requires on-image text.",
                      "Every kind='qa_check' atom must use channel='qa'; it is a verification criterion and must not be included in the image-generation prompt.",
-                     "For no-text QA, forbid added captions, text overlays, subtitles, UI, watermarks, and promotional, discount, price, or shipping claims. Allow native logos, brand lettering, and markings physically printed on the target product only when they are visible in the supplied target-product reference.",
+                     "Do not emit an atom whose id is 'qa_no_text' or starts with 'qa_no_text_'. The canonical no-added-text requirement is injected and checked by code, so Brain must not author a duplicate QA criterion.",
                      "Never invent text, pseudo-lettering, logos, brand names or labels. Reproduce them only when present in supplied product assets or explicitly specified by the offer/brief.",
                      "Never use a forbidden claim.",
                      "When target-product reference photos are supplied, preserve the actual target product's form factor, silhouette, proportions, and distinctive visible parts. Keep the target product body recognizable in the frame; do not substitute a generic lookalike or change a compact handheld product into an upright/stick device.",
@@ -247,6 +289,13 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
                 "MUST atom with channel='image' (kind product/action/scene/composition, never claim) whose id starts with its "
                 "atom_id_prefix (for example mech_intervention_clamp) and whose text shows that link in the TARGET product's own "
                 "scene, with visible, checkable content. Do not copy the source product, brand, creator or setting.")
+            link_names = {link["link"] for link in links}
+            if shots == 1 and {"problem", "result"}.issubset(link_names):
+                req["rules"].append(
+                    "ONE-SHOT COMPOSITION CONTRACT: because both problem and result must be visible in one frame, create an explicit additional MUST image atom with kind='scene', shot=1, and id prefix 'comp_'. Describe a concrete legible layout and locate the problem/result regions; do not copy an existing mech atom into comp_.")
+            elif shots >= 2:
+                req["rules"].append(
+                    "MULTI-SHOT ROUTING CONTRACT: mech_problem_* and mech_intervention_* MUST image atoms go to shot 1; mech_result_* MUST image atoms go to shot 2.")
         req["rules"].extend([
             "When source_transfer is supplied, preserve its causal mechanism and target-native rebuild sequence as structured atom requirements.",
             "The current OfferCard and supplied target-product photos are the ONLY authority for target-product facts. Source-transfer context is authority only for the causal mechanism, not target hardware or specifications. Never copy source-only attachments, tools, features, colors, construction, or product form into target atoms unless visible in target-product references or explicitly confirmed by OfferCard/brief. When no target-native feature is verified, retain the generic target product shown in the reference and transfer the demo logic only.",
@@ -281,11 +330,15 @@ def request_atoms(offer, brief: str, shots: int, call, max_retries: int = 2, ver
             round_errs.setdefault(aid, []).extend(errs)
         for aid, errs in check_language(parsed.atoms).items():
             round_errs.setdefault(aid, []).extend(errs)
+        reserved_no_text = reserved_system_atom_errors(parsed.atoms)
+        for aid, errs in reserved_no_text.items():
+            round_errs.setdefault("#system_owned_qa", []).extend(f"{aid}: {error}" for error in errs)
         if vertical is not None:
             for aid, errs in check_vertical(parsed.atoms, offer, vertical).items():
                 round_errs.setdefault(aid, []).extend(errs)
+        reserved_no_text_ids = set(reserved_no_text)
         for a in parsed.atoms:
-            if a.id in round_errs:
+            if a.id in round_errs or a.id in reserved_no_text_ids:
                 by_id.pop(a.id, None)
             else:
                 by_id[a.id] = a
@@ -298,6 +351,15 @@ def request_atoms(offer, brief: str, shots: int, call, max_retries: int = 2, ver
                 pending[f"#shot_{k}"] = [f"shot {k} has no MUST image atom"]
         for name in missing_mechanism_links(by_id.values(), required_links):
             pending[f"#mechanism_{name}"] = [f"mechanism link '{name}' has no MUST image atom with id prefix mech_{name}_"]
+        structure_errors = visual_structure_errors(by_id.values(), shots, required_links)
+        pending.update(structure_errors)
+        for aid in list(structure_errors):
+            if not aid.startswith("#"):
+                by_id.pop(aid, None)
+        for name in missing_mechanism_links(by_id.values(), required_links):
+            pending[f"#mechanism_{name}"] = [f"mechanism link '{name}' has no MUST image atom with id prefix mech_{name}_"]
+        structure_errors = visual_structure_errors(by_id.values(), shots, required_links)
+        pending.update(structure_errors)
         if not pending:
             return list(by_id.values())
         prev_text = {i["id"]: i.get("text", "") for i in raw if isinstance(i, dict) and i.get("id")}
