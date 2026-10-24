@@ -1,8 +1,7 @@
 """Automatic source selection for unattended runs.
 
-Keeps the legacy ranking order. It gates the handoff to analyst/generator calls:
-video, confirmed target relevance, and an explicit commercial or mechanism-source pass.
-A high view count or DIRECT label alone is not a commercial pass.
+Transfer prefers candidates with a commercial pass, but permits any playable, non-hard-excluded ad
+as a pattern source. Strict commercial checks remain available as ranking evidence.
 """
 from __future__ import annotations
 
@@ -124,9 +123,26 @@ def select_pattern_candidate(candidates):
     return None, skipped
 
 
+def rank_transfer_candidates(candidates):
+    """Put commercially approved sources first; retain usable weaker sources in FIND order."""
+    strong, other, skipped = [], [], []
+    for item in candidates or []:
+        reason = pattern_source_reason(item)
+        if reason:
+            candidate_id = item.get("id") if isinstance(item, dict) else "<invalid>"
+            skipped.append(f"{candidate_id}: {reason}")
+        elif not block_reason(item):
+            strong.append(item)
+        else:
+            other.append(item)
+    return strong + other, skipped
+
+
 def select_transfer_candidate(candidates):
-    """Selection policy for the creative-transfer path; commercial metrics do not gate it."""
-    return select_pattern_candidate(candidates)
+    """Select a pattern source with a soft commercial preference, not a hard score gate."""
+    ordered, skipped = rank_transfer_candidates(candidates)
+    return (ordered[0] if ordered else None), skipped
+
 
 
 def analysis_review_reason(candidate: dict, allowed_classes=None) -> str:
