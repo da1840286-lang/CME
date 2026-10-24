@@ -5,7 +5,7 @@ import os
 import re
 from collections import Counter
 from pathlib import Path
-from ..atoms import ATOM_SCHEMA, KINDS
+from ..atoms import ATOM_SCHEMA, TRANSFER_ATOM_SCHEMA, KINDS
 from ..providers import InfraError, ProviderCallError
 from .http import check_status, data_uri, urllib_transport
 
@@ -73,13 +73,16 @@ def _safe_response_excerpt(content: str, limit: int = 400) -> str:
     excerpt = re.sub(
         r"(?i)\bsk-(?:or-v1|proj|ant|live)-[A-Za-z0-9_-]{8,}|\bsk-[A-Za-z0-9_-]{20,}",
         "[REDACTED]", excerpt)
+    excerpt = re.sub(
+        r"(?i)\b(api[_ -]?key|authorization|access[_ -]?token|refresh[_ -]?token|secret)\s*[:=]\s*['\"]?[^,\s;'\"]+",
+        r"\1=[REDACTED]", excerpt)
     return re.sub(r"\s+", " ", excerpt).strip()[:limit]
 
 
-def _format(params):
+def _format(params, schema=None):
     mode = params.get("response_format_mode", "json_object")
     if mode == "json_schema":
-        return {"type": "json_schema", "json_schema": {"name": "atoms", "strict": True, "schema": ATOM_SCHEMA}}
+        return {"type": "json_schema", "json_schema": {"name": "atoms", "strict": True, "schema": schema or ATOM_SCHEMA}}
     if mode == "json_object":
         return {"type": "json_object"}
     return None
@@ -89,17 +92,49 @@ def make_openrouter_brain(params: dict, api_key=None, transport=None):
     send = transport or urllib_transport
 
     def call(request: dict):
-        system = ("You are the Brain of an ad production system. Reply with ONE JSON object {\"atoms\": [...]} "
+        root_shape = '{"atoms": [...], "transfer_decision": {...}}' if request.get("source_transfer") else '{"atoms": [...]}'
+        system = ("You are the Brain of an ad production system. Reply with ONE JSON object " + root_shape + " "
                   "and nothing else. Each atom: id, kind, text (max 120 chars), priority (MUST/SHOULD/MAY), "
                   f"channel (image/motion/qa), shot. Allowed kinds: {', '.join(KINDS)}. "
                   + " ".join(request.get("rules", [])) + " JSON schema: " + json.dumps(request["schema"]))
-        user = {k: request.get(k) for k in ("offer", "brief", "shots", "only_fix", "source_transfer") if request.get(k) is not None}
+        user = {k: request.get(k) for k in ("offer", "brief", "shots", "only_fix", "source_transfer", "mechanism_links") if request.get(k) is not None}
         content, meta = _chat(params, api_key, send,
                               [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user)}],
-                              _format(params))
+                              _format(params, request.get("schema", ATOM_SCHEMA)))
         data = extract_json(content)
-        if not isinstance(data, dict) or "atoms" not in data:
-            return {"atoms": [], "_error": "response was not a JSON object with an 'atoms' list"}, meta
+        invalid_reason = None
+        if not str(content or "").strip():
+            invalid_reason = "empty_response"
+        elif data is None:
+            # Distinguish valid JSON of the wrong root type from text that is not JSON.
+            try:
+                decoded = json.loads(content)
+            except (TypeError, ValueError):
+                invalid_reason = "invalid_json"
+            else:
+                invalid_reason = "json_root_not_object" if not isinstance(decoded, dict) else "missing_atoms_list"
+        elif not isinstance(data, dict):
+            invalid_reason = "json_root_not_object"
+        elif "atoms" not in data:
+            invalid_reason = "missing_atoms_list"
+        elif not isinstance(data.get("atoms"), list):
+            invalid_reason = "atoms_not_list"
+
+        if invalid_reason:
+            # Logged by call_with_policy as a bounded diagnostic. Never log raw output:
+            # the excerpt is flattened, length-limited, and stripped of common API-key forms.
+            meta = {**meta, "diagnostic": {
+                "component": "openrouter_brain",
+                "reason": invalid_reason,
+                "response_excerpt": _safe_response_excerpt(content),
+                "response_chars": len(str(content or "")),
+                "finish_reason": meta.get("finish_reason"),
+                "completion_tokens": meta.get("completion_tokens"),
+                "reasoning_tokens": meta.get("reasoning_tokens"),
+                "message_has_reasoning": meta.get("message_has_reasoning"),
+                "message_has_refusal": meta.get("message_has_refusal"),
+            }}
+            return {"atoms": [], "_error": f"response rejected: {invalid_reason}"}, meta
         return data, meta
 
     return call

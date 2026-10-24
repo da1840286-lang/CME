@@ -13,12 +13,14 @@ import json
 import sys
 import time
 from pathlib import Path
-from .atoms import check_claims, parse_atoms
-from .brain import BrainError, build_source_transfer_context, request_atoms
+from .atoms import check_claims, check_language, parse_atoms
+from .brain import (BrainError, TransferRejected, atom_budget_errors, build_source_transfer_context,
+                    derive_mechanism_links, missing_mechanism_links, reserved_system_atom_errors,
+                    validate_transfer_decision, visual_structure_errors, request_atoms)
 from .compiler import BudgetError
 from .offer import OfferError, load_offer
 from .providers import CallLog, InfraError, ProviderCallError, ProviderPolicyError
-from .qa import make_qa_checks, validate_product_references
+from .qa import brand_tokens, make_qa_checks, validate_product_references
 from .registry import SettingsError, load_catalog, load_settings, make_brain_call, make_image_provider, make_judge
 from .run import AttemptLimit, produce_shot
 from .state import StateMismatch, load_state, new_run, save_state
@@ -79,6 +81,25 @@ def validate_atoms_manifest(atoms_path, manifest_path, atoms_json, offer, shot=N
     if type(requested) is int and any(type(a.get("shot")) is not int or a["shot"] > requested
                                       for a in atoms_json if isinstance(a, dict)):
         errors["#atoms"] = ["atoms contain a shot outside the Brain contract's requested range"]
+    decision = manifest.get("transfer_decision")
+    if manifest.get("source_contract_sha256"):
+        if not isinstance(decision, dict) or decision.get("transferable") is not True:
+            errors["#transfer_decision"] = ["source-bound manifest must contain transfer_decision.transferable=true"]
+        decision_errors = validate_transfer_decision(decision, atoms_json)
+        if decision_errors:
+            errors["#transfer_decision"] = decision_errors
+    elif decision is not None:
+        decision_errors = validate_transfer_decision(decision, atoms_json)
+        if decision_errors:
+            errors["#transfer_decision"] = decision_errors
+    links = manifest.get("mechanism_links") or []
+    lost_links = missing_mechanism_links(atoms_json, links)
+    if lost_links:
+        errors["#mechanism"] = [f"mechanism link '{n}' is no longer carried by a MUST atom" for n in lost_links]
+    errors.update(reserved_system_atom_errors(atoms_json))
+    if type(requested) is int and requested >= 1:
+        errors.update(visual_structure_errors(atoms_json, requested, links))
+        errors.update(atom_budget_errors(atoms_json, requested))
     if errors:
         raise BrainError(errors)
     return manifest
@@ -89,6 +110,29 @@ def atoms_summary(atoms) -> str:
     for a in atoms:
         rows.setdefault((a.shot, a.channel), {"MUST": 0, "SHOULD": 0, "MAY": 0})[a.priority] += 1
     return "\n".join(f"  shot {s} / {c}: " + ", ".join(f"{k}={v}" for k, v in d.items()) for (s, c), d in sorted(rows.items()))
+
+
+def write_run_result(out: Path, command: str, exit_code: int, failure_class: str, message: str, verdict=None) -> None:
+    """Write diagnostic classification without changing the workflow's established exit codes."""
+    payload = {"command": command, "exit_code": exit_code, "failure_class": failure_class, "status": "OK" if exit_code == 0 else "ERROR", "message": str(message or "")[:1000]}
+    if verdict: payload["verdict"] = verdict
+    try: (Path(out) / "run_result.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc: print(f"Не удалось записать run_result.json: {exc}")
+
+
+def image_seed_for_attempt(base_seed: int, attempt: int, contract_id: str) -> int:
+    """Use a reproducible per-contract seed, then advance it for each retry of that contract."""
+    if type(base_seed) is not int:
+        raise SettingsError("image adapter seed must be an integer")
+    if type(attempt) is not int or attempt < 1:
+        raise SettingsError("frame attempt must be a positive integer")
+    suffix = str(contract_id).rsplit("-", 1)[-1]
+    try:
+        contract_offset = int(suffix[-8:], 16) % 1_000_000
+    except ValueError as exc:
+        raise SettingsError("frame contract_id must end with a hexadecimal digest") from exc
+    # Add one so a new contract never reuses the old catalog seed by default.
+    return base_seed + contract_offset + 1 + attempt - 1
 
 
 def run_brain(args, offer, settings, catalog, vertical, log, run_id, ctx, out):
@@ -106,7 +150,9 @@ def run_brain(args, offer, settings, catalog, vertical, log, run_id, ctx, out):
     manifest_path.unlink(missing_ok=True)
     atoms_path.unlink(missing_ok=True)
     call = make_brain_call(settings, catalog, log, run_id, **ctx)
-    atoms = request_atoms(offer, args.brief, args.shots, call, vertical=vertical, source_transfer=source_transfer)
+    transfer_decision = {}
+    atoms = request_atoms(offer, args.brief, args.shots, call, vertical=vertical,
+                          source_transfer=source_transfer, decision_out=transfer_decision)
     data = [a.to_dict() for a in atoms]
     atoms_path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     fingerprint, photo_hashes = offer_fingerprint(offer)
@@ -114,9 +160,12 @@ def run_brain(args, offer, settings, catalog, vertical, log, run_id, ctx, out):
                 "atoms_sha256": _sha256_bytes(atoms_path.read_bytes()), "offer_fingerprint": fingerprint,
                 "photo_hashes": photo_hashes, "contract_id": contract_id_for(data, offer),
                 "requested_shots": args.shots,
+                "mechanism_links": [l["link"] for l in derive_mechanism_links(source_transfer)],
                 "brief_sha256": _sha256_bytes(args.brief.encode("utf-8")),
                 "source_contract_sha256": _sha256_bytes(Path(args.source_contract).read_bytes()) if args.source_contract else None,
                 "model_id": call.info.get("model_id"), "responded_model": call.info.get("responded_model")}
+    if transfer_decision:
+        manifest["transfer_decision"] = transfer_decision
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"Brain: {len(atoms)} атомов, модель {call.info.get('model_id')} (ответила: {call.info.get('responded_model') or 'не сообщено'})")
     print(atoms_summary(atoms))
@@ -131,6 +180,8 @@ def run_frame(args, offer, settings, catalog, vertical, log, run_id, ctx, out, a
     claim_errors = check_claims(atoms, offer)
     vertical_errors = check_vertical(atoms, offer, vertical)
     merged_errors = {k: list(v) for k, v in claim_errors.items()}
+    for aid, reasons in check_language(atoms).items():
+        merged_errors.setdefault(aid, []).extend(reasons)
     for aid, reasons in vertical_errors.items():
         merged_errors.setdefault(aid, []).extend(reasons)
     if merged_errors:
@@ -149,10 +200,24 @@ def run_frame(args, offer, settings, catalog, vertical, log, run_id, ctx, out, a
         reference_issues = validate_product_references(offer.photos)
         if reference_issues:
             raise OfferError("Product-photo preflight blocked generation: " + "; ".join(reference_issues))
-    provider = make_image_provider(settings, catalog, log, run_id, **ctx)
+    image_seed = None
+    image_spec = catalog.get(settings.image_adapter)
+    if image_spec and image_spec.kind == "image" and image_spec.provider == "hf_space":
+        # A retry is a new, reproducible candidate, not the same fixed-seed image again.
+        image_seed = image_seed_for_attempt(image_spec.params.get("seed", 0), args.attempt, contract_id)
+    provider = make_image_provider(settings, catalog, log, run_id, image_seed=image_seed, **ctx)
     judge = make_judge(settings, catalog, log, run_id, **ctx) if settings.judge_adapter else None
+    transfer_decision = None
+    manifest_path = out / "atoms_manifest.json"
+    if atom_provenance == "verified_manifest" and manifest_path.is_file():
+        try:
+            transfer_decision = json.loads(manifest_path.read_text(encoding="utf-8")).get("transfer_decision")
+        except (OSError, ValueError):
+            transfer_decision = None
     qa = make_qa_checks(atoms, args.shot, judge_fn=judge, ocr_required=not args.no_ocr_required,
-                        verified_claims=offer.verified_claims, product_references=offer.photos)
+                        verified_claims=offer.verified_claims, product_references=offer.photos,
+                        allowed_text=brand_tokens(offer.name, offer.product_type),
+                        transfer_decision=transfer_decision)
     refs = [state.shots[args.shot - 1]["image_path"]] if (args.shot - 1) in state.shots else []
     try:
         receipt, compiled, verdict = produce_shot(
@@ -224,29 +289,47 @@ def main(argv=None, ctx=None) -> int:
             for shot_number in shot_numbers:
                 args.shot = shot_number
                 frame_run_id = args.run_id if shot_number == 1 else f"{args.run_id}-s{shot_number:02d}"
-                verdict = run_frame(args, offer, settings, catalog, vertical, log, frame_run_id, ctx, out, data, atom_provenance)
+                # Retry only rejected/undelivered frames; UNVERIFIED is a checker failure, not a frame failure.
+                tries = min(2, max(1, int(settings.max_attempts_per_shot or 1))) if args.command == "all" else 1
+                for attempt_number in range(1, tries + 1):
+                    args.attempt = attempt_number
+                    verdict = run_frame(args, offer, settings, catalog, vertical, log, frame_run_id, ctx, out, data, atom_provenance)
+                    if verdict not in ("FAILED_QA", "NOT_DELIVERED") or attempt_number == tries:
+                        break
+                    print(f"Кадр {shot_number}: попытка {attempt_number} не прошла QA ({verdict}); новая попытка с другим seed.")
                 if verdict == "UNVERIFIED":
+                    write_run_result(out, args.command, 6, "QA_UNVERIFIED", "Required QA checks did not produce a verifiable verdict.", verdict)
                     return 6
                 if verdict in ("FAILED_QA", "NOT_DELIVERED"):
+                    failure_class = "NOT_DELIVERED" if verdict == "NOT_DELIVERED" else "VISUAL_QA_FAILED"
+                    write_run_result(out, args.command, 7, failure_class, "A required MUST condition was not delivered or did not pass QA.", verdict)
                     return 7
     except FileNotFoundError as e:
-        print(f"Не найден файл: {e.filename}. Скопируйте settings.example.json в settings.json и поправьте его.")
-        return 3
+        message = f"Не найден файл: {e.filename}. Скопируйте settings.example.json в settings.json и поправьте его."
+        print(message); write_run_result(out,args.command,3,"SETUP_OR_FILE_ERROR",message); return 3
     except SettingsError as e:
-        print(f"Ошибка настроек: {e}")
-        return 3
+        message=f"Ошибка настроек: {e}"; print(message); write_run_result(out,args.command,3,"SETTINGS_ERROR",message); return 3
     except InfraError as e:
-        print(f"Сбой инфраструктуры (квота, лимит, сеть): {e}\nЗапись попытки сохранена в {out}. Повторите позже или объявите fallback.")
-        return 2
+        message=f"Сбой инфраструктуры (квота, лимит, сеть): {e}\nЗапись попытки сохранена в {out}. Повторите позже или объявите fallback."
+        print(message); write_run_result(out,args.command,2,"INFRASTRUCTURE_ERROR",message); return 2
     except (GateError, BudgetError, AttemptLimit, ProviderPolicyError, StateMismatch, OfferError) as e:
-        print(f"Остановлено до платного вызова или политикой: {e}")
-        return 3
-    except BrainError as e:
-        print(f"Brain не вернул валидные атомы: {e.errors}")
+        message=f"Остановлено до платного вызова или политикой: {e}"; print(message); write_run_result(out,args.command,3,"CONTRACT_OR_PREFLIGHT_BLOCKED",message); return 3
+    except TransferRejected as e:
+        message = f"TRANSFER_REJECTED: source mechanism cannot be transferred to this target product: {e.decision.get('reason', '')}"
+        print(message)
+        write_run_result(out, args.command, 4, "TRANSFER_REJECTED", message)
         return 4
+    except BrainError as e:
+        message=f"Brain не вернул валидные атомы: {e.errors}"; print(message)
+        error_text=json.dumps(e.errors,ensure_ascii=False)
+        failure_class=("VISUAL_CONTRACT_INVALID" if any(t in error_text for t in ("COMPOSITION_REQUIRED","MECHANISM_SHOT_ORDER","SYSTEM_OWNED_QA","transfer_decision")) else "BRAIN_OUTPUT_INVALID")
+        write_run_result(out,args.command,4,failure_class,message)
     except ProviderCallError as e:
-        print(f"Провайдер ответил ошибкой: {e}")
-        return 5
+        message=f"Провайдер ответил ошибкой: {e}"; print(message); write_run_result(out,args.command,5,"PROVIDER_RESPONSE_ERROR",message); return 5
+    if args.command == "brain":
+        write_run_result(out,args.command,0,"BRAIN_CONTRACT_READY","Brain contract and manifest passed validation.")
+    else:
+        write_run_result(out,args.command,0,"DELIVERED_PASS","All requested frames passed the configured delivery and QA gates.","PASS")
     return 0
 
 

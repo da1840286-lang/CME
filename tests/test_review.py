@@ -5,7 +5,7 @@ from cme.brain import BrainError, request_atoms
 from cme.compiler import BudgetError
 from cme.offer import load_offer
 from cme.providers import CallLog, InfraError, ModelRef, ProviderPolicyError, call_with_policy
-from cme.qa import CheckResult, file_check
+from cme.qa import frame_content_check, CheckResult, file_check
 from cme.receipt import attach_qa, build_video_receipt, overall
 from cme.run import produce_shot
 from cme.state import StateMismatch, accept_shot, new_run
@@ -32,14 +32,14 @@ class B1_EveryMustNeedsVerification(unittest.TestCase):
 
     def test_pass_only_when_each_must_atom_has_a_passing_check(self):
         atoms = [A("scene", "A bright kitchen counter"), A("prod", "Product in the foreground")]
-        qa = lambda p: [file_check("file", p), CheckResult("scene", "PASS", True, "judge"),
+        qa = lambda p: [frame_content_check("frame_content", p), CheckResult("scene", "PASS", True, "judge"),
                         CheckResult("prod", "PASS", True, "judge")]
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(run_shot(atoms, qa, d)[2], "PASS")
 
     def test_should_atoms_do_not_block_pass(self):
         atoms = [A("scene", "A bright kitchen counter"), A("nice", "Warm light", "SHOULD")]
-        qa = lambda p: [file_check("file", p), CheckResult("scene", "PASS", True, "judge")]
+        qa = lambda p: [frame_content_check("frame_content", p), CheckResult("scene", "PASS", True, "judge")]
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(run_shot(atoms, qa, d)[2], "PASS")
 
@@ -47,7 +47,7 @@ class B1_EveryMustNeedsVerification(unittest.TestCase):
 class B2_ImageAndVideoReceiptsAreSeparate(unittest.TestCase):
     def test_motion_atom_does_not_block_an_image_shot(self):
         atoms = [A("scene", "A bright kitchen counter"), A("mv", "Slow push in", ch="motion")]
-        qa = lambda p: [file_check("file", p), CheckResult("scene", "PASS", True, "judge")]
+        qa = lambda p: [frame_content_check("frame_content", p), CheckResult("scene", "PASS", True, "judge")]
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(run_shot(atoms, qa, d)[2], "PASS")
 
@@ -56,7 +56,7 @@ class B2_ImageAndVideoReceiptsAreSeparate(unittest.TestCase):
         missing = build_video_receipt("c", "r", 1, atoms, "Shot 1: Slow push in")
         self.assertEqual(overall(missing), "NOT_DELIVERED")
         full = build_video_receipt("c", "r", 1, atoms, "Shot 1: Slow push in\nShot 2: Pan left")
-        done = attach_qa(full, atoms, [CheckResult("video_file", "PASS"), CheckResult("mv", "PASS", True, "judge"),
+        done = attach_qa(full, atoms, [CheckResult("video_file", "PASS", pixels=True), CheckResult("mv", "PASS", True, "judge"),
                                        CheckResult("mv2", "PASS", True, "judge")])
         self.assertEqual(overall(done), "PASS")
         unchecked = attach_qa(full, atoms, [CheckResult("video_file", "PASS")])

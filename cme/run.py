@@ -6,8 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from .compiler import BudgetError, compile_image_prompt
-from .atoms import check_claims
-from .atoms import check_claims
+from .atoms import check_claims, check_language
 from .receipt import assert_exact_payload, attach_qa, build_receipt, overall
 from .state import accept_shot, record_attempt
 from .vertical import GateError, check_vertical, offer_gate
@@ -61,7 +60,9 @@ def produce_shot(*, offer, atoms, shot, contract_id, state, out_dir, image_provi
         _blocked(state, out, shot, attempt, "BLOCKED_ATTEMPTS", f"{max_attempts} attempts already used for shot {shot}")
         raise AttemptLimit(f"attempt limit {max_attempts} reached for shot {shot} in this offer/contract")
     # Defence in depth: all entry paths, including hand-supplied atoms, get the same contract checks.
-    claim_errors = check_claims(atoms, offer)
+    claim_errors = {k: list(v) for k, v in check_claims(atoms, offer).items()}
+    for aid, msgs in check_language(atoms).items():
+        claim_errors.setdefault(aid, []).extend(msgs)
     if claim_errors:
         reasons = [f"{aid}: {msg}" for aid, msgs in claim_errors.items() for msg in msgs]
         _blocked(state, out, shot, attempt, "BLOCKED_CLAIMS", "; ".join(reasons))

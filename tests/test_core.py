@@ -1,6 +1,7 @@
 import json, tempfile, unittest
 from pathlib import Path
 from cme.atoms import ATOM_SCHEMA, MAX_TEXT, check_claims, parse_atoms
+from cme.brain import build_request
 from cme.compiler import BudgetError, compile_image_prompt, compile_motion_prompt
 from cme.offer import OfferError, load_offer
 from tests.helpers import A
@@ -66,6 +67,53 @@ class AtomTests(unittest.TestCase):
         claim = parse_atoms([self.good(kind="claim", text="Reusable and dishwasher safe")]).atoms
         errors = check_claims(claim, o)
         self.assertIn("CLAIM_CHANNEL", errors["a_1"][0])
+
+    def test_qa_check_must_live_in_qa_channel_not_image_prompt(self):
+        bad = parse_atoms([self.good(kind="qa_check", text="No added text", channel="image")])
+        self.assertEqual(bad.atoms, [])
+        self.assertIn("QA_CHECK_CHANNEL", bad.errors["a_1"][0])
+
+        qa_atom = self.good(id="qa_no_text", kind="qa_check", text="No added overlays", channel="qa")
+        parsed = parse_atoms([self.good(), qa_atom])
+        self.assertEqual(parsed.errors, {})
+        self.assertEqual(compile_image_prompt(parsed.atoms, 1).text, "A kitchen counter")
+
+    def test_brain_does_not_author_system_owned_no_text_check(self):
+        request = build_request(load_offer(EX), "brief", 1)
+        rules = " ".join(request["rules"])
+        self.assertIn("kind='qa_check'", rules)
+        self.assertIn("channel='qa'", rules)
+        self.assertIn("qa_no_text", rules)
+        self.assertIn("injected and checked by code", rules)
+        self.assertNotIn("allow native logos", rules)
+
+    def test_target_product_form_factor_is_preserved(self):
+        request = build_request(load_offer(EX), "brief", 1)
+        rules = " ".join(request["rules"])
+        self.assertIn("form factor, silhouette, proportions", rules)
+        self.assertIn("Keep the target product body recognizable", rules)
+
+    def test_source_only_hardware_does_not_transfer_to_target_product(self):
+        request = build_request(load_offer(EX), "brief", 1, source_transfer={
+            "format": "radar_analysis_hypothesis",
+            "buyer_problem": "Dust is hard to see in dark corners",
+            "product_intervention": "Source vacuum has a motorized brush, hose, and green LED",
+            "result_demo": "Green LED reveals dirt beside a wall",
+        })
+        rules = " ".join(request["rules"])
+        self.assertIn("Source-transfer context is authority only for the causal mechanism", rules)
+        self.assertIn("Never copy source-only attachments, tools, features", rules)
+        self.assertIn("confirmed by OfferCard/brief", rules)
+        self.assertIn("omit accessories not visible", rules)
+
+    def test_source_transfer_result_atoms_require_a_visible_before_after_boundary(self):
+        request = build_request(load_offer(EX), "brief", 1,
+                                source_transfer={"mechanism_hypothesis": "show removal of the problem"})
+        rules = " ".join(request["rules"])
+        self.assertIn("untreated/dirty side", rules)
+        self.assertIn("treated/clean side", rules)
+        self.assertIn("at their visible boundary", rules)
+        self.assertIn("substantial, unobstructed debris-free strip", rules)
 
 
 class CompilerTests(unittest.TestCase):
