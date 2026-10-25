@@ -261,23 +261,25 @@ class PatternTransferSelectionTests(unittest.TestCase):
         chosen, _ = select_candidate([candidate])
         self.assertIsNone(chosen)
 
-    def test_long_low_score_source_can_transfer_its_pattern(self):
+    def test_commercially_rejected_long_source_is_not_auto_selected(self):
         candidate = self.candidate("long", relevance="DIRECT", final=0.0,
                                    performance=86.0, commercial=0.0, duration=83.5)
         self.assertEqual(pattern_source_reason(candidate), "")
-        picked, _ = select_transfer_candidate([candidate])
-        self.assertEqual(picked["id"], "long")
-        self.assertIn("REJECT", block_reason(candidate))
+        picked, skipped = select_transfer_candidate([candidate])
+        self.assertIsNone(picked)
+        self.assertTrue(any("REJECT" in reason or "money-signal" in reason or "duration" in reason
+                            for reason in skipped))
 
-    def test_low_or_unverified_relevance_is_metadata_not_a_hard_block(self):
+    def test_low_or_unverified_relevance_is_not_auto_eligible(self):
         low = self.candidate("low", relevance="LOW", final=0.0, performance=0.0, commercial=0.0)
         unverified = self.candidate("unverified", relevance="UNVERIFIED", final=None,
                                     performance=None, commercial=None, action="UNKNOWN")
         for candidate in (low, unverified):
             with self.subTest(candidate=candidate["id"]):
                 self.assertEqual(pattern_source_reason(candidate), "")
-        picked, _ = select_transfer_candidate([low, unverified])
-        self.assertEqual(picked["id"], "low")
+        picked, skipped = select_transfer_candidate([low, unverified])
+        self.assertIsNone(picked)
+        self.assertTrue(any("LOW" in reason for reason in skipped))
         self.assertEqual(analysis_review_reason(unverified), "")
 
     def test_missing_video_and_hard_exclusions_remain_blocked(self):
@@ -294,7 +296,8 @@ class PatternTransferSelectionTests(unittest.TestCase):
     def test_selector_skips_unusable_records_but_keeps_existing_order(self):
         blocked = self.candidate("blocked", relevance="HARD_EXCLUDE")
         missing = self.candidate("missing", video=None)
-        usable = self.candidate("usable", relevance="UNVERIFIED", final=0, performance=0, commercial=0)
+        usable = self.candidate("usable", relevance="EXPANDED", final=35, performance=25,
+                                commercial=15, money_pass=True, action="DEEP")
         picked, skipped = select_transfer_candidate([blocked, missing, usable])
         self.assertEqual(picked["id"], "usable")
         self.assertEqual(len(skipped), 2)

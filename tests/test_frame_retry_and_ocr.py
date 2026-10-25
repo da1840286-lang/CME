@@ -1,4 +1,4 @@
-"""Frame retry inside all, word-level OCR, and soft source ranking."""
+"""Frame retry inside all, word-level OCR, and strict auto-transfer eligibility."""
 import json
 import shutil
 import tempfile
@@ -162,22 +162,24 @@ def cand(cid, video=True, cls="DIRECT", money=True, action="DEEP"):
             "source_score": {"action": action, "final_score": 50, "components": {"money_signal_gate": {"pass": money}}}}
 
 
-class SoftSelectionTests(unittest.TestCase):
-    def test_strong_sources_first_weak_ones_still_usable(self):
+class AutoTransferEligibilityTests(unittest.TestCase):
+    def test_commercially_eligible_source_is_selected_and_weak_sources_are_skipped(self):
         ordered, skipped = rank_transfer_candidates([
             cand("weak", money=False), cand("strong"), cand("novideo", video=False),
             cand("excluded", cls="HARD_EXCLUDE")])
-        self.assertEqual([c["id"] for c in ordered], ["strong", "weak"])
+        self.assertEqual([c["id"] for c in ordered], ["strong"])
+        self.assertEqual(len(skipped), 3)
+
+    def test_find_order_is_preserved_among_commercially_eligible_sources(self):
+        ordered, skipped = rank_transfer_candidates([
+            cand("a"), cand("b"), cand("c", money=False), cand("d", money=False)])
+        self.assertEqual([c["id"] for c in ordered], ["a", "b"])
         self.assertEqual(len(skipped), 2)
 
-    def test_find_order_kept_inside_each_group(self):
-        ordered, _ = rank_transfer_candidates([
-            cand("a"), cand("b"), cand("c", money=False), cand("d", money=False)])
-        self.assertEqual([c["id"] for c in ordered], ["a", "b", "c", "d"])
-
-    def test_weak_only_pool_is_not_rejected(self):
-        chosen, _ = select_transfer_candidate([cand("only", money=False, cls="UNVERIFIED", action="REJECT")])
-        self.assertEqual(chosen["id"], "only")
+    def test_weak_only_pool_is_rejected(self):
+        chosen, skipped = select_transfer_candidate([cand("only", money=False, cls="UNVERIFIED", action="REJECT")])
+        self.assertIsNone(chosen)
+        self.assertEqual(len(skipped), 1)
 
     def test_empty_pool_returns_none(self):
         self.assertEqual(select_transfer_candidate([]), (None, []))

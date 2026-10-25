@@ -611,6 +611,7 @@ jobs:
           out = Path("out").resolve()
           from cme.radar.select import pattern_source_reason, select_transfer_candidate
           from cme.radar.select import rank_transfer_candidates
+          from cme.radar.source_loop import analyze_with_invalid_output_retry
           requested_cid = os.environ.get("CANDIDATE_ID", "").strip()
           skipped = []
           if requested_cid:
@@ -811,7 +812,7 @@ jobs:
                   summary.write(f"- Source score (metadata): {score.get('final_score')}\n")
                   summary.write(f"- Analysis attempts: {len(attempts)}\n")
                   summary.write("- Each source analysis attempt is recorded in source_analysis_attempts.json. Only a successful analysis is handed to production.\n\n")
-              from cme.radar.source_loop import analyze_with_invalid_output_retry, run_source_loop
+              from cme.radar.source_loop import run_source_loop
 
               initial_candidate, initial_cid = candidate, cid
               initial_status, initial_analysis, initial_saved = status, analysis, saved
