@@ -682,26 +682,23 @@ def discover_and_rank(
             if _has_video_url(record) and not _is_hard_excluded(record)
         )
 
-    def source_money_ready_count() -> int:
-        """Count candidates that pass the same pre-video money gate used by Selection."""
-        # This is deliberately derived from score_tiktok_candidate(), not a looser
-        # metadata heuristic. Discovery must never stop on a candidate that Selection
-        # would immediately reject.
-        count = 0
+    def source_analysis_ready_counts() -> tuple[int, int]:
+        """Count distinct candidates ready for analysis via either supported path.
+
+        Commercial readiness must pass the same Selection gate. The alternate path is
+        allowed only when the scorer independently reports mechanism_source_score >= 70
+        and keeps the action non-REJECT (including the intentional long-source exception).
+        """
+        money_count = 0
+        mechanism_count = 0
         from .verticals import source_market_evidence
 
         records = [r for r in eligible_records() if not r.get("seen_before")]
         strict_pool, expanded_pool, _, _ = _classify(records, vertical, mode="strict")
-        # The stop gate must measure the same target-relevant market that powers
-        # target_relevant_count(). Broad/UNVERIFIED inventory may remain available
-        # for diagnostics or later source verification, but cannot make a target
-        # queue look money-ready just because its metadata resembles an ad.
-        target_market_records = strict_pool + expanded_pool
-        for record in target_market_records:
+        for record in strict_pool + expanded_pool:
             if not _has_video_url(record):
                 continue
 
-            # Terminal source-market conflicts are never eligible for the stop gate.
             try:
                 market = source_market_evidence(record, vertical) if vertical else {}
             except Exception:
@@ -727,18 +724,30 @@ def discover_and_rank(
             except Exception:
                 continue
 
-            if _money_ready_item({
-                "record": record,
-                "decision": decision,
-            }):
-                count += 1
-        return count
+            item = {"record": record, "decision": decision}
+            if _money_ready_item(item):
+                money_count += 1
+                continue
+
+            action = str(getattr(decision, "action", "") or "").upper()
+            source_value_type = str(getattr(decision, "source_value_type", "") or "").upper()
+            try:
+                mechanism_score = float(getattr(decision, "mechanism_source_score", 0) or 0)
+            except (TypeError, ValueError):
+                mechanism_score = 0.0
+            if (
+                action in {"DEEP", "SHALLOW"}
+                and source_value_type in {"MECHANISM_SOURCE", "BOTH"}
+                and mechanism_score >= 70.0
+            ):
+                mechanism_count += 1
+
+        return money_count, mechanism_count
     if supply_search and mode != "mechanism-hunt":
-        # Adaptive live policy:
-        # 1) use high-signal product/brand Sponsored Search,
-        # 2) if it finds no target supply, spend the next cheap request on another seed,
-        # 3) only enter an expensive performance board after target supply exists,
-        # 4) never use a broad performance board as a substitute for target discovery.
+        # Live adaptive policy:
+        # 1) keep searching target/product queries while no source passes a supported readiness gate,
+        # 2) permit Ads Top only after a commercial money-gate pass or an independent mechanism-source score >= 70,
+        # 3) if bounded target search produces no qualified source, stop without buying broad Ads Top inventory.
         supply_search_budget = min(max(0, int(keyword_boards)), max_requests)
         supply_queries = _ordered_supply_queries(
             vertical, explicit, max_count=supply_search_budget, search_tags_dir=search_tags_dir,
@@ -747,14 +756,13 @@ def discover_and_rank(
         search_calls = 0
         top_index = 0
         while len(calls) < max_requests:
-            target_count = target_relevant_count()
-            money_count = source_money_ready_count()
+            money_count, mechanism_count = source_analysis_ready_counts()
+            analysis_ready_count = money_count + mechanism_count
 
-            if (
-                target_count == 0
-                and search_calls < supply_search_budget
-                and query_index < len(supply_queries)
-            ):
+            if analysis_ready_count >= source_queue_limit:
+                break
+
+            if analysis_ready_count == 0 and search_calls < supply_search_budget and query_index < len(supply_queries):
                 kw = supply_queries[query_index]
                 query_index += 1
                 search_calls += 1
@@ -769,22 +777,23 @@ def discover_and_rank(
                 )
                 continue
 
-            if target_count > 0 or search_calls >= supply_search_budget or query_index >= len(supply_queries):
-                if money_count >= source_queue_limit:
-                    break
-                if len(calls) >= max_requests:
-                    break
-                order_by = order_list[top_index % len(order_list)]
-                total_credits = _fetch_plan(
-                    client=client, country=country, period=period, industry=industry, vertical=vertical,
-                    ad_language=ad_language, limit_per_board=limit_per_board,
-                    plan=[(order_by, None)], combined=combined, calls=calls,
-                    total_credits=total_credits,
-                )
-                top_index += 1
-                continue
+            # Target relevance without commercial/mechanism readiness is not enough to
+            # justify the expensive Ads Top query. Keep the rejected source in diagnostics.
+            if analysis_ready_count == 0:
+                break
 
-            break
+            # A qualified source exists. Only now may Ads Top be used to fill an incomplete queue.
+            if len(calls) >= max_requests:
+                break
+            order_by = order_list[top_index % len(order_list)]
+            total_credits = _fetch_plan(
+                client=client, country=country, period=period, industry=industry, vertical=vertical,
+                ad_language=ad_language, limit_per_board=limit_per_board,
+                plan=[(order_by, None)], combined=combined, calls=calls,
+                total_credits=total_credits,
+            )
+            top_index += 1
+            continue
     else:
         # Legacy Ads Top path: keep the old broad/performance behaviour when the
         # dedicated Sponsored Search supply lane is explicitly disabled.
@@ -1007,16 +1016,16 @@ def discover_and_rank(
         1 for record in (strict_pool + expanded_pool)
         if _has_video_url(record) and not _is_hard_excluded(record)
     )
-    money_ready_source_ads = source_money_ready_count()
-    if money_ready_source_ads >= source_queue_limit:
-        discovery_stop_basis = "money_ready_source_queue"
+    money_ready_source_ads, mechanism_ready_source_ads = source_analysis_ready_counts()
+    analysis_ready_source_ads = money_ready_source_ads + mechanism_ready_source_ads
+    if analysis_ready_source_ads >= source_queue_limit:
+        discovery_stop_basis = "analysis_ready_source_queue"
+    elif len(calls) >= max_requests and analysis_ready_source_ads == 0:
+        discovery_stop_basis = "request_budget_exhausted_no_analysis_ready_source"
+    elif analysis_ready_source_ads == 0 and target_relevant_ads > 0:
+        discovery_stop_basis = "target_relevance_waiting_for_money_or_mechanism_gate"
     elif len(calls) >= max_requests:
-        discovery_stop_basis = (
-            "request_budget_exhausted_no_money_ready_source"
-            if money_ready_source_ads == 0 else "request_budget_exhausted"
-        )
-    elif target_relevant_ads >= source_queue_limit:
-        discovery_stop_basis = "target_relevance_waiting_for_money_gate"
+        discovery_stop_basis = "request_budget_exhausted"
     elif target_relevant_ads > 0 and _source_queue_candidate_count(fresh_records, vertical) >= source_queue_limit:
         discovery_stop_basis = "target_relevance_and_queue"
     else:
@@ -1038,6 +1047,8 @@ def discover_and_rank(
         "source_ready_ads": _discovery_ready_count(records, vertical),
         "source_queue_eligible_ads": _source_queue_candidate_count(fresh_records, vertical),
         "money_ready_source_ads": money_ready_source_ads,
+        "mechanism_ready_source_ads": mechanism_ready_source_ads,
+        "analysis_ready_source_ads": analysis_ready_source_ads,
         "target_relevant_ads": target_relevant_ads,
         "target_relevant_shortfall": max(0, source_queue_limit - target_relevant_ads),
         "discovery_stop_basis": discovery_stop_basis,
@@ -1079,7 +1090,7 @@ def discover_and_rank(
             "supply_lane": "tiktok_search_sponsored" if supply_search else "ads_top",
             "supply_queries_planned": supply_queries if supply_search and mode != "mechanism-hunt" else [],
             "supply_queries_executed": [c.get("keyword", "") for c in calls if c.get("source") == "sponsored_search"],
-            "query_failover_policy": "strong_seed -> alternate_seed_if_zero_target -> performance_only_after_target",
+            "query_failover_policy": "target_seeds_until_money_or_mechanism_ready -> Ads Top only after source gate",
         },
         "search_tags_file": str(search_tags_path(vertical, search_tags_dir)),
         "search_tags_available": load_search_tags(vertical, search_tags_dir),

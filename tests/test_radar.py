@@ -8,6 +8,7 @@ from cme.radar import analyze as A
 from cme.radar.legacy import discover as legacy_discover
 from cme.radar.legacy.discovery import tiktok_socialcrawl as T
 from cme.radar.server import RadarApp, make_server
+from cme.radar.select import select_candidate
 from cme.radar.store import Store
 from tests.helpers import png_bytes
 from tests.radar_fixtures import FakeResp, synthetic_post, synthetic_response
@@ -60,24 +61,92 @@ class VendoredCodeIsTheRealOne(Env):
     def test_run_find_calls_the_real_client_and_ranker(self):
         calls = []
         with self.fake_find([synthetic_post("1001")], calls):
-            res = F.run_find({"country": "us", "max_requests": 2}, client=T.SocialCrawlTikTokTopAds(api_key="TESTKEY"))
+            res = F.run_find({"country": "us", "max_requests": 2, "keywords": ["car vacuum"],
+                              "offer": {"name": "Fanttik V8 Mate Cordless Car Vacuum",
+                                        "product_type": "cordless handheld car vacuum"}},
+                             client=T.SocialCrawlTikTokTopAds(api_key="TESTKEY"))
         self.assertTrue(calls and "socialcrawl" in calls[0][0] and len(calls) <= 2)
-        self.assertEqual(calls[0][1].get("country"), "US")
+        self.assertEqual(calls[0][0], T.SocialCrawlTikTokTopAds.SEARCH_URL)
+        self.assertEqual(calls[0][1].get("region"), "US")
+        self.assertEqual(calls[0][1].get("query"), "car vacuum")
         sc = res["candidates"][0]["source_score"]
         self.assertIsNotNone(sc["final_score"])  # produced by the old arbitrage.score_tiktok_candidate
         self.assertEqual(res["request"]["vertical"], "Physical Products")
+        self.assertEqual(res["request"]["search_terms"], ["car vacuum", "Fanttik V8 Mate Cordless Car Vacuum", "cordless handheld car vacuum"])
+        self.assertTrue(res["stats"]["discovery_strategy"]["supply_search_enabled"])
+        self.assertEqual(res["candidates"][0]["metrics"]["views"]["source"], "socialcrawl:tiktok_sponsored_search")
+
+    def test_find_uses_product_terms_and_reports_raw_rows_rejected_by_source_gate(self):
+        calls = []
+        def fake_get(url, params=None, headers=None, timeout=None):
+            params = dict(params or {})
+            calls.append((url, params))
+            # Intentionally neutral synthetic source: usable media but no shop/product evidence.
+            item = synthetic_post(str(7100 + len(calls)), title="[SYNTHETIC TEST] neutral lifestyle clip")
+            item["post"]["ext"]["ad"]["landing_page_url"] = "https://example.invalid/page"
+            item["post"]["ext"]["ad"]["landing_page"] = ""
+            item["post"]["ext"]["ad"]["industry"] = "Entertainment"
+            return FakeResp(synthetic_response([item]))
+        with mock.patch.object(T.requests, "get", fake_get):
+            res = F.run_find({"country": "US", "max_requests": 3, "keywords": ["car vacuum"],
+                              "offer": {"name": "Fanttik V8 Mate Cordless Car Vacuum",
+                                        "product_type": "cordless handheld car vacuum"}},
+                             client=T.SocialCrawlTikTokTopAds(api_key="TESTKEY"))
+        queries = [p["query"] for url, p in calls if url == T.SocialCrawlTikTokTopAds.SEARCH_URL]
+        self.assertEqual(queries, ["car vacuum", "Fanttik V8 Mate Cordless Car Vacuum", "cordless handheld car vacuum"])
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(url == T.SocialCrawlTikTokTopAds.SEARCH_URL for url, _ in calls))
+        self.assertEqual(res["candidates"], [])  # no weakening of the target-relevance gate
+        self.assertEqual(res["diagnostics"]["outcome"], "NO_TARGET_RELEVANCE")
+        self.assertEqual(res["diagnostics"]["raw_ads_returned"], 3)
+        self.assertEqual(res["diagnostics"]["requests_executed"], 3)
+
+    def test_target_relevance_without_money_gate_uses_next_sponsored_query_not_ads_top(self):
+        calls = []
+        def fake_get(url, params=None, headers=None, timeout=None):
+            params = dict(params or {})
+            calls.append((url, params))
+            item = synthetic_post(
+                str(9200 + len(calls)), brand="UNKNOWN",
+                title="Shop now free shipping: cordless car vacuum removes crumbs",
+                ctr=None, cvr=None, views=3110000, duration=28,
+            )
+            item["post"]["author"]["username"] = "UNKNOWN"
+            item["post"]["author"]["display_name"] = ""
+            ad = item["post"]["ext"]["ad"]
+            ad["ctr"] = None
+            ad["cvr"] = None
+            ad["objective"] = ""
+            ad["landing_page_url"] = ""
+            item["post"]["content"]["text"] = "Shop now free shipping: cordless car vacuum removes crumbs"
+            return FakeResp(synthetic_response([item]))
+        with mock.patch.object(T.requests, "get", fake_get):
+            result = F.run_find(
+                {"country": "US", "max_requests": 2, "max_ads": 1, "keywords": ["car vacuum"],
+                 "offer": {"name": "Fanttik V8 Mate Cordless Car Vacuum",
+                           "product_type": "cordless handheld car vacuum"}},
+                client=T.SocialCrawlTikTokTopAds(api_key="TESTKEY"),
+            )
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(url == T.SocialCrawlTikTokTopAds.SEARCH_URL for url, _ in calls))
+        self.assertEqual([params.get("query") for _, params in calls],
+                         ["car vacuum", "Fanttik V8 Mate Cordless Car Vacuum"])
+        self.assertEqual(result["stats"]["money_ready_source_ads"], 0)
+        self.assertEqual(result["stats"]["mechanism_ready_source_ads"], 0)
+        self.assertGreaterEqual(result["stats"]["target_relevant_ads"], 1)
+        self.assertNotIn("ads_top", [call.get("source") for call in result["stats"]["calls"]])
 
 
 class CandidateRecord(Env):
-    def run(self, *items):
+    def run_candidates(self, *items):
         with self.fake_find(list(items)):
             return F.run_find({"country": "US", "max_requests": 1}, client=T.SocialCrawlTikTokTopAds(api_key="K"),
                               now="2026-10-21T00:00:00Z")["candidates"]
 
     def test_provenance_url_and_real_metrics_are_kept(self):
-        c = self.run(synthetic_post("1001", views=120000, ctr=2.4))[0]
+        c = self.run_candidates(synthetic_post("1001", views=120000, ctr=2.4))[0]
         self.assertEqual(c["metrics"]["views"]["value"], 120000)
-        self.assertEqual(c["metrics"]["views"]["source"], "socialcrawl:tiktok_ads_top")
+        self.assertEqual(c["metrics"]["views"]["source"], "socialcrawl:tiktok_sponsored_search")
         self.assertEqual(c["metrics"]["views"]["collected_at"], "2026-10-21T00:00:00Z")
         self.assertEqual(c["metrics"]["ctr"]["value"], 2.4)
         self.assertTrue(c["source_url"].startswith("https://example.invalid/ad/1001"))
@@ -86,14 +155,20 @@ class CandidateRecord(Env):
         self.assertIn("legacy_record", c)
 
     def test_unknown_stays_unknown_not_zero(self):
-        c = self.run(synthetic_post("1002", views=None, ctr=None, cvr=None))[0]
+        c = self.run_candidates(synthetic_post("1002", views=None, ctr=None, cvr=None))[0]
         for name in ("views", "ctr", "cvr"):
             self.assertNotIn(name, c["metrics"])
 
     def test_missing_video_is_none_not_invented(self):
         post = synthetic_post("1003")
         post["post"]["content"]["media_urls"] = []
-        c = self.run(post)[0]
+        record = T.SocialCrawlTikTokTopAds._unwrap_item(post)
+        c = F.to_candidate(
+            {"record": record},
+            {"country": "US", "period": 30, "vertical": "Physical Products"},
+            "2026-10-23T00:00:00Z",
+            "found",
+        )
         self.assertIsNone(c["video_url"])
 
 
@@ -206,6 +281,23 @@ class FindStates(Env):
         self.assertIn("SOCIALCRAWL_API_KEY", res["detail"])
         self.assertEqual(app.store.counts()["found"], 0)
 
+    def test_local_find_uses_configured_offer_and_returns_source_diagnostics(self):
+        offer_path = Path(self.tmp.name) / "offer.json"
+        offer_path.write_text(json.dumps({"name": "Fanttik V8 Mate Cordless Car Vacuum",
+                                          "product_type": "cordless handheld car vacuum",
+                                          "product_category": "car cleaning"}), encoding="utf-8")
+        calls = []
+        app = RadarApp(self.data, settings_path=ROOT / "settings.example.json", catalog_path=ROOT / "adapters.json",
+                       offer_path=offer_path, find_client=T.SocialCrawlTikTokTopAds(api_key="K"))
+        with self.fake_find([synthetic_post("8101")], calls):
+            result = app.do_find({"country": "US", "max_requests": 1, "max_ads": 3})
+        self.addCleanup(app.store.close)
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(calls[0][1].get("query"), "Fanttik V8 Mate Cordless Car Vacuum")
+        self.assertIn("diagnostics", result)
+        self.assertEqual(result["diagnostics"]["outcome"], "CANDIDATES_FOUND")
+        self.assertEqual(result["discovery_strategy"]["supply_search_calls_used"], 1)
+
     def test_api_failure_is_reported_not_replaced(self):
         def boom(*a, **k):
             raise OSError("network down")
@@ -220,6 +312,62 @@ class FindStates(Env):
         self.assertEqual(app.do_find({"period": 14})["status"], "BAD_REQUEST")
         self.assertEqual(app.do_find({"max_requests": 99})["status"], "BAD_REQUEST")
 
+
+
+class AutomaticSourceReadinessGate(unittest.TestCase):
+    @staticmethod
+    def candidate(cid, *, action, final_score, tags, money_pass=False,
+                  mechanism_score=0, source_value_type="NONE", duration_block=False):
+        return {
+            "id": cid,
+            "video_url": "https://example.invalid/ad.mp4",
+            "source_check": {"classification": "DIRECT", "excluded": False},
+            "source_score": {
+                "action": action,
+                "final_score": final_score,
+                "tags": tags,
+                "mechanism_source_score": mechanism_score,
+                "source_value_type": source_value_type,
+                "components": {
+                    "money_signal_gate": {"pass": money_pass, "hard_block": not money_pass},
+                    "duration": {"hard_block": duration_block},
+                },
+            },
+        }
+
+    def test_reject_money_block_and_zero_score_are_skipped(self):
+        rejected = self.candidate(
+            "rejected", action="REJECT", final_score=0,
+            tags=["money_signal_hard_block", "duration_over_60_hard_block"],
+        )
+        money_blocked = self.candidate(
+            "money-blocked", action="SHALLOW", final_score=64,
+            tags=["money_signal_hard_block"],
+        )
+        zero_score = self.candidate(
+            "zero-score", action="DEEP", final_score=0,
+            tags=["money_signal_pass"], money_pass=True, source_value_type="COMMERCIAL_WINNER",
+        )
+        selected, skipped = select_candidate([rejected, money_blocked, zero_score])
+        self.assertIsNone(selected)
+        self.assertEqual(len(skipped), 3)
+        self.assertIn("action is REJECT", skipped[0])
+        self.assertIn("money-signal hard block", skipped[1])
+        self.assertIn("zero or below", skipped[2])
+
+    def test_money_gate_or_explicit_mechanism_exception_can_pass(self):
+        commercial = self.candidate(
+            "commercial", action="DEEP", final_score=70,
+            tags=["money_signal_pass"], money_pass=True, source_value_type="COMMERCIAL_WINNER",
+        )
+        mechanism = self.candidate(
+            "mechanism", action="DEEP", final_score=0,
+            tags=["money_signal_hard_block", "duration_over_60_hard_block", "long_source_allowed_for_mechanism"],
+            mechanism_score=72, source_value_type="MECHANISM_SOURCE", duration_block=True,
+        )
+        selected, skipped = select_candidate([mechanism, commercial])
+        self.assertEqual(selected["id"], "mechanism")
+        self.assertEqual(skipped, [])
 
 def fake_runner(frames_dir_times=None):
     """Stands in for ffprobe/ffmpeg: duration 12s; every ffmpeg call writes a tiny file."""

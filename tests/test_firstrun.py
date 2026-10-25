@@ -212,6 +212,49 @@ class OpenRouterBrainTests(unittest.TestCase):
         self.assertEqual(data["atoms"], [])
         self.assertIn("_error", data)
 
+    def test_brain_catalog_uses_strict_json_schema_only_for_brain(self):
+        catalog = load_catalog(ROOT / "adapters.json")
+        self.assertEqual(catalog["openrouter_free_brain"].params["response_format_mode"], "json_schema")
+        self.assertEqual(catalog["openrouter_free_judge"].params["response_format_mode"], "json_object")
+        self.assertEqual(catalog["openrouter_free_analyst"].params["response_format_mode"], "json_object")
+
+    def test_json_schema_mode_is_sent_to_openrouter(self):
+        calls = []
+        params = {"model_id": "vendor/model:free", "response_format_mode": "json_schema"}
+        fn = make_openrouter_brain(params, "key", self.sender(calls=calls))
+        fn(self.request())
+        payload = calls[0][2]
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertIs(payload["response_format"]["json_schema"]["strict"], True)
+        self.assertEqual(payload["response_format"]["json_schema"]["schema"], ATOM_SCHEMA)
+
+    def test_invalid_brain_response_logs_redacted_excerpt_and_token_diagnostics(self):
+        with tempfile.TemporaryDirectory() as d:
+            payload = {
+                "model": "vendor/model:free",
+                "choices": [{"message": {"content": "No JSON found; api_key=sentinel-secret-value; key=sk-or-v1-12345678901234567890"}, "finish_reason": "length"}],
+                "usage": {"cost": 0, "completion_tokens": 73,
+                          "completion_tokens_details": {"reasoning_tokens": 19}},
+            }
+            send = lambda method, url, headers, body: (200, json.dumps(payload).encode())
+            fn = make_openrouter_brain(self.PARAMS, "key", send)
+            request = self.request()
+            logged = call_with_policy(
+                ModelRef("openrouter", "vendor/model:free", "free"),
+                lambda ref: fn(request), CallLog(Path(d) / "calls.jsonl"), "brain-test", allow_free=True)
+            self.assertEqual(logged["atoms"], [])
+            row = json.loads((Path(d) / "calls.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            diagnostic = row["diagnostic"]
+            self.assertEqual(diagnostic["component"], "openrouter_brain")
+            self.assertEqual(diagnostic["reason"], "invalid_json")
+            self.assertEqual(diagnostic["finish_reason"], "length")
+            self.assertEqual(diagnostic["completion_tokens"], 73)
+            self.assertEqual(diagnostic["reasoning_tokens"], 19)
+            self.assertLessEqual(len(diagnostic["response_excerpt"]), 400)
+            self.assertIn("No JSON found", diagnostic["response_excerpt"])
+            self.assertNotIn("sk-or-v1-12345678901234567890", diagnostic["response_excerpt"])
+            self.assertNotIn("sentinel-secret-value", diagnostic["response_excerpt"])
+
     def test_status_classification(self):
         with self.assertRaises(InfraError):
             make_openrouter_brain(self.PARAMS, "k", self.sender(429, b"slow down"))(self.request())
@@ -310,10 +353,12 @@ class QASuiteTests(unittest.TestCase):
         self.assertEqual({c["check_id"]: c["status"] for c in r.checks}["no_text"], "NOT_RUN")
 
     def test_pass_needs_code_checks_and_every_must(self):
-        _, _, v = self.verdict(make_qa_checks(self.atoms, 1, judge_fn=self.judge_ok, ocr=lambda p: ""))
+        # Non-empty OCR output with no disallowed words verifies the no-text check;
+        # an empty OCR result is unverified and is covered by test_ocr_never_silent_pass.
+        _, _, v = self.verdict(make_qa_checks(self.atoms, 1, judge_fn=self.judge_ok, ocr=lambda p: "ok"))
         self.assertEqual(v, "PASS")
         _, _, v2 = self.verdict(make_qa_checks(self.atoms, 1, judge_fn=None, ocr=lambda p: ""))
-        self.assertEqual(v2, "UNVERIFIED")  # no judge, MUST atoms unverified
+        self.assertEqual(v2, "UNVERIFIED")  # no judge and no OCR evidence cannot pass
 
     def test_ocr_can_be_declared_not_required_but_stays_visible(self):
         r, _, v = self.verdict(make_qa_checks(self.atoms, 1, judge_fn=self.judge_ok, ocr_required=False))
@@ -331,7 +376,7 @@ class QASuiteTests(unittest.TestCase):
             judged_ids.extend(a.id for a in batch)
             return {a.id: {"pass": True, "evidence": "seen"} for a in batch}
 
-        qa = make_qa_checks(atoms, 1, judge_fn=judge, ocr=lambda p: "",
+        qa = make_qa_checks(atoms, 1, judge_fn=judge, ocr=lambda p: "ok",
                             verified_claims=offer.verified_claims)
         with tempfile.TemporaryDirectory() as d:
             receipt, _, verdict = produce_shot(

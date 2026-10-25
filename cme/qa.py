@@ -1,13 +1,21 @@
-"""Tiered QA. Code checks first. A model judge can add evidence but never grants PASS alone."""
+"""Tiered QA. Code checks first.
+
+PASS needs (a) a code check that looked at the pixels (OCR, blank-frame, anchor similarity), and (b) every MUST
+atom verified. For image atoms (b) can only come from the Judge, so in practice the Judge decides MUST atoms and
+code guards the frame itself (decodes, not blank, no stray text). The Judge alone cannot produce PASS.
+"""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from collections.abc import Sequence
 from PIL import Image, ImageChops, ImageStat
-from .atoms import norm
+from .atoms import Atom, norm
+from .branding import NO_BRANDING, TARGET_BRAND_ALLOWED, qa_branding_rule
 
 
 PRODUCT_IDENTITY_CHECK_ID = "cme_product_identity_ref"
+SYSTEM_NO_TEXT_ID = "system_no_text_policy"
+SYSTEM_NO_TEXT_RULE = qa_branding_rule(TARGET_BRAND_ALLOWED)
 MAX_PRODUCT_REFERENCES_FOR_JUDGE = 3
 
 
@@ -18,6 +26,7 @@ class CheckResult:
     required: bool = True
     source: str = "code"  # code / judge
     detail: str = ""
+    pixels: bool = False  # True only when the check actually looked at the frame content
 
 
 def file_check(check_id, path, expected_size=None, required=True) -> CheckResult:
@@ -32,6 +41,23 @@ def file_check(check_id, path, expected_size=None, required=True) -> CheckResult
     if expected_size and tuple(size) != tuple(expected_size):
         return CheckResult(check_id, "FAIL", required, "code", f"size {size} != {expected_size}")
     return CheckResult(check_id, "PASS", required, "code", f"size {size}")
+
+
+def frame_content_check(check_id, path, min_std=4.0, min_range=32, required=True) -> CheckResult:
+    """Code check on pixels: a blank or near-uniform frame is a failed generation, whatever the Judge says.
+
+    The thresholds are stubs; calibrate them on real frames.
+    """
+    try:
+        with Image.open(path) as im:
+            gray = im.convert("L")
+            std = ImageStat.Stat(gray).stddev[0]
+            lo, hi = gray.getextrema()
+    except Exception as e:
+        return CheckResult(check_id, "FAIL", required, "code", f"cannot read frame content: {e}", True)
+    ok = std >= min_std and (hi - lo) >= min_range
+    return CheckResult(check_id, "PASS" if ok else "FAIL", required, "code",
+                       f"contrast std {std:.1f} range {hi - lo}" + ("" if ok else " (blank or near-uniform frame)"), True)
 
 
 def validate_product_references(paths: Sequence[str | Path]) -> list[str]:
@@ -77,28 +103,88 @@ def anchor_similarity(check_id, prev_path, cur_path, region, min_similarity=0.85
             ca, cb = a.crop(box).resize((32, 32)), b.crop(box).resize((32, 32))
             diff = ImageStat.Stat(ImageChops.difference(ca, cb)).mean[0] / 255.0
     except Exception as e:
-        return CheckResult(check_id, "FAIL", required, "code", f"cannot compare: {e}")
+        return CheckResult(check_id, "FAIL", required, "code", f"cannot compare: {e}", True)
     sim = 1.0 - diff
     status = "PASS" if sim >= min_similarity else "FAIL"
-    return CheckResult(check_id, status, required, "code", f"similarity {sim:.3f} (min {min_similarity})")
+    return CheckResult(check_id, status, required, "code", f"similarity {sim:.3f} (min {min_similarity})", True)
 
 
-def ocr_text_check(check_id, path, text_allowed, ocr=None, max_chars=3, required=True):
-    """No-text rule. Without an OCR engine the check is NOT_RUN, never a silent PASS."""
+OCR_MIN_CONF = 60       # tesseract word confidence below this is texture noise, not text
+OCR_MIN_WORD = 3        # one- and two-letter fragments are never counted as visible text
+OCR_BRAND_RATIO = 0.8   # tolerance for OCR misreads of the product's own lettering
+
+
+def brand_tokens(name: str, product_type: str = "") -> tuple:
+    """Allow printed target name/model terms, excluding generic words already in product_type."""
+    import re
+    name_words = {t.lower() for t in re.findall(r"[^\W_]+", str(name or "")) if len(t) >= OCR_MIN_WORD}
+    category_words = {t.lower() for t in re.findall(r"[^\W_]+", str(product_type or "")) if len(t) >= OCR_MIN_WORD}
+    return tuple(sorted(name_words - category_words))
+
+
+def _tesseract_confident_words(path) -> str:
+    """Read confident text using several page-segmentation modes.
+
+    Short promotional overlays can be missed by Tesseract's default layout mode. Try
+    both block and sparse-text layouts so an empty first pass cannot hide visible text.
+    """
+    import pytesseract  # optional dependency
+    words = []
+    with Image.open(path) as im:
+        for psm in (3, 11, 12):
+            data = pytesseract.image_to_data(
+                im, config=f"--psm {psm}", output_type=pytesseract.Output.DICT
+            )
+            for word, conf in zip(data.get("text", []), data.get("conf", [])):
+                try:
+                    c = float(conf)
+                except (TypeError, ValueError):
+                    continue
+                word = str(word).strip()
+                if word and c >= OCR_MIN_CONF:
+                    words.append(word)
+    # The same visible word is often returned by more than one layout pass.
+    return " ".join(dict.fromkeys(words))
+
+
+def ocr_text_check(check_id, path, text_allowed, ocr=None, max_chars=3, required=True, allowed_tokens=()):
+    """No-text rule. Without an OCR engine the check is NOT_RUN, never a silent PASS.
+
+    Counts confident words of 3+ characters which are not allowed product-brand/model terms.
+    Added captions, prices and promo text still fail; texture noise and reference-native product
+    lettering may pass. The detail lists the found words to make failures diagnosable.
+    """
+    import re
+    from difflib import SequenceMatcher
     if ocr is None:
         try:
-            import pytesseract  # optional dependency
-            ocr = lambda p: pytesseract.image_to_string(Image.open(p))  # noqa: E731
+            import pytesseract  # noqa: F401
+            ocr = _tesseract_confident_words
         except Exception:
             return CheckResult(check_id, "NOT_RUN", required, "code", "no OCR engine available")
     try:
-        found = "".join(ch for ch in ocr(path) if ch.isalnum())
+        raw = ocr(path)
     except Exception as e:
         return CheckResult(check_id, "NOT_RUN", required, "code", f"OCR failed: {e}")
-    if text_allowed or len(found) <= max_chars:
-        return CheckResult(check_id, "PASS", required, "code", f"{len(found)} text chars")
-    return CheckResult(check_id, "FAIL", required, "code", f"{len(found)} text chars found, none allowed")
+    if not text_allowed and not str(raw or "").strip():
+        return CheckResult(
+            check_id, "NOT_RUN", required, "code",
+            "OCR returned no confident words; absence of text is unverified",
+        )
+    allowed = {str(t).lower() for t in allowed_tokens if len(str(t)) >= OCR_MIN_WORD}
 
+    def own_lettering(tok):
+        t = tok.lower()
+        return any(t == a or SequenceMatcher(None, t, a).ratio() >= OCR_BRAND_RATIO for a in allowed)
+
+    tokens = [t for t in re.findall(r"[^\W_]+", str(raw or "")) if len(t) >= OCR_MIN_WORD]
+    foreign = [t for t in tokens if not own_lettering(t)]
+    found = "".join(foreign)
+    if text_allowed or len(found) <= max_chars:
+        return CheckResult(check_id, "PASS", required, "code", f"{len(found)} text chars", True)
+    sample = ", ".join(foreign[:8])
+    return CheckResult(check_id, "FAIL", required, "code",
+                       f"{len(found)} text chars found, none allowed: {sample}", True)
 
 def judge_checks(path, qa_atoms, judge_fn, required=False):
     """judge_fn(path, atom_text) -> bool. Evidence only: source='judge'."""
@@ -155,18 +241,48 @@ def judge_batch_checks(path, atoms, judge_fn, required=False, reference_images=(
     return out
 
 
+REFERENCE_CHECK_ID = "reference_no_lettering"
+
+
+def check_reference_unbranded(path, judge_fn, shot=1):
+    """Independent pixel check of the image that will be sent to the generator as the product reference.
+    An empty OCR result never confirms a clean reference; only a Judge PASS does."""
+    from .branding import reference_lettering_rule
+    if judge_fn is None:
+        return CheckResult(REFERENCE_CHECK_ID, "NOT_RUN", True, "judge", "no Judge available to confirm the prepared reference")
+    atom = Atom(REFERENCE_CHECK_ID, "qa_check", reference_lettering_rule(), "MUST", "qa", shot)
+    for row in judge_batch_checks(path, [atom], judge_fn, required=True):
+        if row.check_id == REFERENCE_CHECK_ID:
+            return row
+    return CheckResult(REFERENCE_CHECK_ID, "NOT_RUN", True, "judge", "Judge returned no verdict for the reference")
+
+
 def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr_required=True,
-                   text_allowed=False, anchors=(), verified_claims=(), product_references=()):
-    """Build QA for one shot; optional product references add a required identity comparison."""
+                   text_allowed=False, anchors=(), verified_claims=(), product_references=(), allowed_text=(),
+                   transfer_decision=None, branding_policy=TARGET_BRAND_ALLOWED, approved_brand_marks=()):
+    """Build QA for one shot, with independent visual checks for preserved source properties."""
     claims = [a for a in atoms if a.shot == shot and a.channel == "qa" and a.kind == "claim"]
     claim_set = {norm(c) for c in verified_claims}
     pool = [a for a in atoms if a.shot == shot and a.channel in ("image", "qa")
-            and not (a.channel == "qa" and a.kind == "claim")]
+            and not (a.channel == "qa" and a.kind == "claim")
+            and a.id != "qa_no_text" and not a.id.startswith("qa_no_text_")]
     product_refs = tuple(str(p) for p in list(product_references or ())[:MAX_PRODUCT_REFERENCES_FOR_JUDGE])
 
     def run(path):
+        ocr_result = ocr_text_check(
+            "no_text", path, text_allowed, ocr=ocr, required=ocr_required, allowed_tokens=allowed_text
+        )
+        # Empty OCR stays NOT_RUN. A required visual Judge is the independent fallback in strict mode.
+        if (branding_policy == NO_BRANDING and judge_fn is not None
+                and ocr_result.status == "NOT_RUN"
+                and ocr_result.detail.startswith("OCR returned no confident words")):
+            ocr_result = replace(
+                ocr_result, required=False,
+                detail=ocr_result.detail + "; required system_no_text_policy visual Judge is the independent fallback"
+            )
         res = [file_check("file", path, expected_size),
-               ocr_text_check("no_text", path, text_allowed, ocr=ocr, required=ocr_required)]
+               frame_content_check("frame_content", path),
+               ocr_result]
         for cid, prev, region, minimum in anchors:
             res.append(anchor_similarity(cid, prev, path, region, minimum))
         for a in claims:
@@ -175,8 +291,33 @@ def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr
                 a.id, "PASS" if valid else "FAIL", a.priority == "MUST", "code",
                 "matches verified offer claim; not inferred from pixels" if valid
                 else "claim is absent from offer.verified_claims"))
-        if judge_fn is not None and (pool or product_refs):
-            res.extend(judge_batch_checks(path, pool, judge_fn, reference_images=product_refs))
+        if judge_fn is not None:
+            system_no_text = Atom(SYSTEM_NO_TEXT_ID, "qa_check", qa_branding_rule(branding_policy, approved_brand_marks), "MUST", "qa", shot)
+            judge_atoms = [*pool, system_no_text]
+            transfer_check_ids = set()
+            rows_by_id = {a.id: a for a in atoms}
+            preserved = (transfer_decision or {}).get("preserved", []) if isinstance(transfer_decision, dict) else []
+            if isinstance(preserved, list):
+                for index, item in enumerate(preserved, 1):
+                    if not isinstance(item, dict):
+                        continue
+                    carrier = rows_by_id.get(str(item.get("atom_id") or ""))
+                    prop = str(item.get("property") or "").strip()
+                    if carrier is None or carrier.shot != shot or not prop:
+                        continue
+                    check_id = f"transfer_preserved_{index}"
+                    transfer_check_ids.add(check_id)
+                    judge_atoms.append(Atom(
+                        check_id, "qa_check",
+                        "Independent transfer-preservation visual check. Source-mechanism property that must be "
+                        f"visible in this generated target-product frame: {prop}. Intended carrier atom text: "
+                        f"{carrier.text}. Judge the actual pixels, not the wording. PASS only if the stated "
+                        "property is visibly demonstrated; FAIL if the frame shows an unrelated demo or the "
+                        "property is not visually evidenced.",
+                        "MUST", "qa", shot))
+            judge_rows = judge_batch_checks(path, judge_atoms, judge_fn, reference_images=product_refs)
+            required_judge_ids = {SYSTEM_NO_TEXT_ID, *transfer_check_ids}
+            res.extend(replace(row, required=True) if row.check_id in required_judge_ids else row for row in judge_rows)
         elif product_refs:
             res.append(CheckResult(PRODUCT_IDENTITY_CHECK_ID, "NOT_RUN", True, "judge",
                                    "no Judge adapter configured; target-product identity was not compared"))

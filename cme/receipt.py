@@ -98,7 +98,8 @@ def assert_exact_payload(receipt: Receipt, payload_text: str) -> None:
 def attach_qa(receipt: Receipt, atoms, results) -> Receipt:
     """Enrich the same receipt (identity unchanged) with QA results."""
     checks = tuple({"check_id": r.check_id, "status": r.status, "required": r.required,
-                    "source": r.source, "detail": r.detail} for r in results)
+                    "source": r.source, "detail": r.detail,
+                     "pixels": bool(getattr(r, "pixels", False))} for r in results)
     qa = {c["check_id"]: c["status"] for c in checks}
     return replace(receipt, checks=checks,
                    rows=_rows(atoms, receipt.scope, receipt.shot, receipt.sent_prompt, qa))
@@ -111,7 +112,8 @@ def overall(receipt: Receipt) -> str:
         return NOT_DELIVERED
     if any(c["required"] and c["status"] == "FAIL" for c in checks) or any(r["status"] == FAILED_QA for r in must):
         return FAILED_QA
-    code_pass = any(c["source"] == "code" and c["status"] == "PASS" for c in checks)
+    # file integrity or a claim matching the offer card says nothing about the frame: only pixel checks count
+    code_pass = any(c["source"] == "code" and c["status"] == "PASS" and c.get("pixels") for c in checks)
     if (not code_pass
             or any(c["required"] and c["status"] == "NOT_RUN" for c in checks)
             or any(r["status"] != VERIFIED for r in must)):

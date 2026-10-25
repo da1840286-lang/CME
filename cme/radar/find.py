@@ -11,6 +11,9 @@ import time
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
+# Search-only seeds for the live Sponsored Search lane. Keep separate from the
+# legacy CTA/tag corpus, which is retained for byte-identical compatibility.
+PRODUCT_SEARCH_TAGS_DIR = DATA_DIR / "product_search_tags"
 os.environ.setdefault("CME_VERTICALS_DIR", str(DATA_DIR / "verticals"))  # before the legacy import
 
 VERTICAL = "Physical Products"
@@ -64,7 +67,9 @@ def to_candidate(item: dict, request: dict, collected_at: str, origin: str, sour
     """item = {'record': old record, 'decision': ArbitrageDecision or its saved dict}."""
     rec = item["record"]
     decision = item.get("decision")
-    src = source_label or "socialcrawl:tiktok_ads_top"
+    source_kind = str(rec.get("discovery_source") or "")
+    default_source = "socialcrawl:tiktok_sponsored_search" if source_kind == "tiktok_sponsored_search" else "socialcrawl:tiktok_ads_top"
+    src = source_label or default_source
     boards = list(rec.get("discovery_boards") or [])
     metrics = {}
     for name in METRIC_FIELDS:
@@ -77,9 +82,11 @@ def to_candidate(item: dict, request: dict, collected_at: str, origin: str, sour
     score = None
     if decision is not None:
         score = {k: _d(decision, k) for k in ("final_score", "performance_score", "commercial_score", "funnel_fit_score",
-                                              "evidence_score", "longevity_score", "duration_fit_score", "action")}
+                                              "evidence_score", "longevity_score", "duration_fit_score", "action",
+                                              "mechanism_source_score", "source_value_type")}
         score["penalties"] = _d(decision, "penalties")
         score["tags"] = _d(decision, "tags")
+        score["components"] = _d(decision, "components") or {}
     why = {"explanation": _d(decision, "explanation"), "action": _d(decision, "action"), "tags": _d(decision, "tags"),
            "scope": rec.get("discovery_scope"), "boards": boards, "keywords": rec.get("discovery_keywords") or [],
            "hits": rec.get("discovery_hits"), "relevance_reason": rel.get("reason")}
@@ -106,8 +113,77 @@ def to_candidate(item: dict, request: dict, collected_at: str, origin: str, sour
     return c
 
 
+def _clean_terms(value) -> list[str]:
+    """Normalize comma-separated or list-form source-query inputs without inventing terms."""
+    if isinstance(value, str):
+        values = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = []
+    out, seen = [], set()
+    for raw in values:
+        term = " ".join(str(raw or "").strip().split())
+        key = term.casefold()
+        if not term or key == "auto" or key in seen:
+            continue
+        seen.add(key)
+        out.append(term)
+    return out
+
+
+def _offer_context(params: dict) -> dict[str, str]:
+    """Read only the product-identifying fields used by FIND from an optional OfferCard."""
+    raw_offer = params.get("offer")
+    offer = raw_offer if isinstance(raw_offer, dict) else {}
+    fields = {
+        "target_offer": params.get("target_offer") or params.get("offer_name") or offer.get("name"),
+        "product_type": params.get("product_type") or offer.get("product_type"),
+        "product_category": params.get("product_category") or offer.get("product_category"),
+        "prelander": params.get("prelander") or "",
+        "landing_page": params.get("landing_page") or "",
+    }
+    return {key: " ".join(str(value or "").strip().split()) for key, value in fields.items()}
+
+
+def _find_diagnostics(stats: dict, candidate_count: int) -> dict:
+    """A truthful compact summary: distinguish no API rows from rows rejected by source gates."""
+    calls = stats.get("calls") or []
+    strategy = stats.get("discovery_strategy") or {}
+    raw_returned = sum(int(call.get("returned") or 0) for call in calls if isinstance(call, dict))
+    direct = int(stats.get("direct_relevant_ads") or 0)
+    expanded = int(stats.get("expanded_relevant_ads") or 0)
+    hard_excluded = int(stats.get("pre_visual_verification_hard_excluded_ads") or 0)
+    if candidate_count:
+        outcome = "CANDIDATES_FOUND"
+        explanation = "FIND produced a ranked candidate list. Video availability and hard exclusions determine pattern-source eligibility; relevance and commercial signals remain scoring evidence."
+    elif raw_returned == 0:
+        outcome = "NO_API_ROWS"
+        explanation = "SocialCrawl returned no ad rows; check query coverage, credentials, provider response, and available credits."
+    elif direct + expanded == 0:
+        outcome = "NO_TARGET_RELEVANCE"
+        explanation = "SocialCrawl returned rows, but none entered the target candidate list. Inspect query coverage, video availability and hard-exclusion diagnostics; commercial success is not required to extract a pattern."
+    else:
+        outcome = "NO_RANKED_CANDIDATE"
+        explanation = "Source-relevant rows were observed, but FIND returned no ranked candidate; inspect request, video-availability and source-relevance diagnostics."
+    return {
+        "outcome": outcome,
+        "explanation": explanation,
+        "search_lane": strategy.get("supply_lane") or "unknown",
+        "requests_executed": int(stats.get("executed_requests") or len(calls)),
+        "raw_ads_returned": raw_returned,
+        "unique_ads": int(stats.get("unique_ads") or 0),
+        "direct_relevant_ads": direct,
+        "expanded_relevant_ads": expanded,
+        "unverified_ads": int(stats.get("unverified_ads") or 0),
+        "hard_excluded_ads": hard_excluded,
+        "search_queries_executed": list(strategy.get("supply_queries_executed") or []),
+        "request_sources": [str(call.get("source") or "unknown") for call in calls if isinstance(call, dict)],
+    }
+
+
 def run_find(params: dict, client=None, now: str | None = None) -> dict:
-    """One manual FIND run. Spends SocialCrawl credits: at most max_requests API calls."""
+    """One manual FIND run. Product-source search first; at most max_requests API calls."""
     st = find_status()
     if st["state"] == "UNAVAILABLE":
         raise FindUnavailable("UNAVAILABLE", st["detail"])
@@ -126,22 +202,40 @@ def run_find(params: dict, client=None, now: str | None = None) -> dict:
     if not enabled:
         raise FindUnavailable("NOT_CONFIGURED", find_status()["detail"] or "SOCIALCRAWL_API_KEY is not set")
     order_bys = [str(x) for x in (params.get("order_bys") or ["for_you"])]
-    keywords = [str(x).strip() for x in (params.get("keywords") or []) if str(x).strip()]
-    request = {"country": country, "period": period, "order_bys": order_bys, "keywords": keywords,
+    user_keywords = _clean_terms(params.get("keywords"))
+    offer = _offer_context(params)
+    # Query exact operator terms first, then offer identity, product type and category.
+    # The adaptive ranker can fall back to product-category seeds from product_search_tags;
+    # CTA-only tags are intentionally not used as the first discovery lane.
+    search_terms = _clean_terms(user_keywords + [offer["target_offer"], offer["product_type"], offer["product_category"]])
+    request = {"country": country, "period": period, "order_bys": order_bys, "keywords": user_keywords,
+               "search_terms": search_terms, "target_offer": offer["target_offer"],
+               "product_type": offer["product_type"], "product_category": offer["product_category"],
                "max_ads": max_ads, "max_requests": max_requests, "vertical": VERTICAL}
     try:
         ranked = discover_and_rank(
-            client=client, country=country, period=period, keywords=keywords, order_bys=order_bys,
+            client=client, country=country, period=period, keywords=search_terms, order_bys=order_bys,
             limit_per_board=int(params.get("limit_per_board") or 10), max_ads=max_ads, max_requests=max_requests,
-            vertical=VERTICAL, discovery_mode=str(params.get("discovery_mode") or "auto"),
-            search_tags_dir=DATA_DIR / "search_tags", supply_search=False)
+            keyword_boards=max_requests, vertical=VERTICAL, target_offer=offer["target_offer"],
+            prelander=offer["prelander"], landing_page=offer["landing_page"],
+            discovery_mode=str(params.get("discovery_mode") or "auto"),
+            search_tags_dir=PRODUCT_SEARCH_TAGS_DIR, supply_search=True)
     except SocialCrawlError as e:
         raise FindUnavailable("UNAVAILABLE", str(e)) from e
     except OSError as e:  # network errors from requests derive from OSError
         raise FindUnavailable("UNAVAILABLE", f"{type(e).__name__}: {e}") from e
     stamp = now or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    return {"candidates": [to_candidate(x, request, stamp, "found") for x in ranked],
-            "stats": getattr(client, "last_discovery_stats", {}) or {}, "request": request}
+    candidates = [to_candidate(x, request, stamp, "found") for x in ranked]
+    stats = getattr(client, "last_discovery_stats", {}) or {}
+    strategy = stats.setdefault("discovery_strategy", {})
+    executed_calls = stats.get("calls") or []
+    strategy["request_policy"] = "Sponsored Search for explicit/product terms first; Ads Top only after DIRECT/EXPANDED target supply appears."
+    strategy["supply_search_enabled"] = True
+    strategy["supply_lane"] = "tiktok_sponsored_search_then_ads_top_on_target"
+    strategy["supply_search_calls_used"] = sum(1 for call in executed_calls if call.get("source") == "sponsored_search")
+    strategy["performance_calls_used"] = sum(1 for call in executed_calls if call.get("source") == "ads_top")
+    diagnostics = _find_diagnostics(stats, len(candidates))
+    return {"candidates": candidates, "stats": stats, "request": request, "diagnostics": diagnostics}
 
 
 def import_discovery_file(path) -> dict:

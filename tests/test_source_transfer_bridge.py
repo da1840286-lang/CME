@@ -13,6 +13,9 @@ from cme.smoke import main as smoke_main
 ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
 EX = ROOT / "examples" / "offer_example.json"
 GOOD = {"id": "s1_scene", "kind": "scene", "text": "A clean kitchen counter", "priority": "MUST", "channel": "image", "shot": 1}
+DECISION = {"transferable": True, "abstract_mechanism": "Show a clear problem and visible improvement",
+            "preserved": [{"property": "the visible problem changes into a visibly improved result", "atom_id": "s1_scene"}],
+            "reason": "The target product can honestly demonstrate the same cause and visible result."}
 
 
 class SourceTransferBridgeTests(unittest.TestCase):
@@ -85,16 +88,21 @@ class SourceTransferBridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported source contract"):
             build_source_transfer_context({"hello": "world"})
 
-    def test_request_keeps_transfer_context_and_atom_retry_contract(self):
+    def test_request_keeps_transfer_context_and_requires_decision_schema(self):
+        from cme.atoms import ATOM_SCHEMA, TRANSFER_ATOM_SCHEMA
         ctx = build_source_transfer_context(self.old_contract())
         offer = load_offer(EX)
+        self.assertIs(build_request(offer, "Make an ad", 1)["schema"], ATOM_SCHEMA)
         req = build_request(offer, "Make an ad", 1, source_transfer=ctx)
+        self.assertIs(req["schema"], TRANSFER_ATOM_SCHEMA)
+        self.assertTrue(any("TRANSFER DECISION" in rule for rule in req["rules"]))
         self.assertEqual(req["source_transfer"], ctx)
         self.assertTrue(any("not the source ad's exact scene" in rule for rule in req["rules"]))
         calls = []
         def call(payload):
             calls.append(payload)
-            return {"atoms": [GOOD, dict(GOOD)]} if len(calls) == 1 else {"atoms": [GOOD]}
+            return ({"atoms": [GOOD, dict(GOOD)], "transfer_decision": DECISION} if len(calls) == 1
+                    else {"atoms": [GOOD], "transfer_decision": DECISION})
         atoms = request_atoms(offer, "Make an ad", 1, call, max_retries=1, source_transfer=ctx)
         self.assertEqual(len(atoms), 1)
         self.assertEqual(len(calls), 2)
@@ -110,9 +118,17 @@ class SourceTransferBridgeTests(unittest.TestCase):
             source_path = root / "old_contract.json"
             source_path.write_text(json.dumps(self.old_contract()), encoding="utf-8")
             sent = []
+            fit_decision = {"transferable": True,
+                            "abstract_mechanism": DECISION["abstract_mechanism"],
+                            "target_native_mapping": "Show the target product solving a recognizable task with visible proof",
+                            "target_evidence": ["kitchen storage"],
+                            "reason": "The target offer can demonstrate a problem and inspectable improvement"}
             def transport(method, url, headers, payload):
                 sent.append(payload)
-                answer = {"atoms": [GOOD]}
+                user_payload = json.loads(payload["messages"][1]["content"])
+                answer = ({"atoms": [], "transfer_decision": fit_decision}
+                          if user_payload.get("task") == "target_fit_gate"
+                          else {"atoms": [GOOD], "transfer_decision": DECISION})
                 response = {"model": payload["model"], "choices": [{"message": {"content": json.dumps(answer)}}]}
                 return 200, json.dumps(response).encode()
             out = root / "out"
@@ -124,13 +140,15 @@ class SourceTransferBridgeTests(unittest.TestCase):
             self.assertEqual(user["source_transfer"]["mechanism"]["canonical_slug"], "demonstrate-then-prove")
             manifest = json.loads((out / "atoms_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["source_contract_sha256"], hashlib.sha256(source_path.read_bytes()).hexdigest())
+            self.assertTrue(manifest["target_fit_gate"]["transferable"])
+            self.assertTrue((out / "target_fit_gate.json").is_file())
 
     def test_openrouter_sends_optional_source_transfer_as_a_distinct_payload_field(self):
         ctx = build_source_transfer_context(self.old_contract())
         seen = []
         def send(method, url, headers, payload):
             seen.append(payload)
-            body = {"model": payload["model"], "choices": [{"message": {"content": json.dumps({"atoms": [GOOD]})}}]}
+            body = {"model": payload["model"], "choices": [{"message": {"content": json.dumps({"atoms": [GOOD], "transfer_decision": DECISION})}}]}
             return 200, json.dumps(body).encode()
         brain = make_openrouter_brain({"model_id": "vendor/test", "response_format_mode": "json_object"}, "key", send)
         brain(build_request(load_offer(EX), "brief", 1, source_transfer=ctx))
