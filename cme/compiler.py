@@ -45,10 +45,17 @@ def _fit(pool, limit, reserve, render):
     return Compiled(text, tuple(a.id for a in keep), tuple(dropped), len(text), limit)
 
 
+FRAME_FORM_INSTRUCTION = (
+    "FRAME FORM: one single continuous photograph from one camera view; never a collage, grid, multi-panel layout, "
+    "split-screen, dividers or borders. Any before/after contrast lies on one continuous surface inside that single photo.")
+
+
 def compile_image_prompt(atoms, shot: int, limit: int = IMAGE_LIMIT, reserve: int = 0,
                         branding_policy=None, approved_brand_marks=()) -> Compiled:
     pool = [a for a in atoms if a.shot == shot and a.channel == "image"]
     instruction = branding_prompt_instruction(branding_policy, approved_brand_marks) if branding_policy is not None else ""
+    if instruction:
+        instruction = instruction + " " + FRAME_FORM_INSTRUCTION
     def render(selected):
         rows = ([instruction] if instruction else []) + [a.text for a in selected]
         return "\n".join(rows)

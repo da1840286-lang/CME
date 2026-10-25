@@ -5,7 +5,7 @@
 from __future__ import annotations
 import re
 from .atoms import ATOM_SCHEMA, TRANSFER_ATOM_SCHEMA, check_claims, check_language, parse_atoms
-from .branding import TARGET_BRAND_ALLOWED, brain_branding_rule
+from .branding import TARGET_BRAND_ALLOWED, brain_branding_rule, resolved_brand_marks
 from .vertical import check_vertical
 
 
@@ -227,13 +227,24 @@ def missing_mechanism_links(atoms, links) -> list:
     return missing
 
 
+_BRAND_TEXT_CHECK = re.compile(r"\b(logos?|brand(ing|s)?|wordmarks?|lettering|watermarks?|captions?|subtitles?|"
+                               r"(no|any|without|free of)\s+(visible\s+)?(text|labels?|writing))\b", re.I)
+
+
 def reserved_system_atom_errors(atoms) -> dict:
-    """Brain must not author a no-text criterion; QA injects the canonical system rule."""
+    """Brain must not author branding or no-text criteria; the campaign policy injects the canonical rule.
+
+    A Brain-written 'no logos' check contradicts target_brand_allowed and duplicates the system check otherwise.
+    """
     errors = {}
     for atom in atoms:
-        aid, _priority, _channel, _kind = _atom_view(atom)
+        aid, _priority, channel, kind = _atom_view(atom)
+        text = atom.get("text") if isinstance(atom, dict) else getattr(atom, "text", "")
         if str(aid) == "qa_no_text" or str(aid).startswith("qa_no_text_"):
             errors[str(aid)] = ["SYSTEM_OWNED_QA: do not author qa_no_text atoms; the canonical no-text check is injected by code"]
+        elif kind == "qa_check" and _BRAND_TEXT_CHECK.search(str(text or "")):
+            errors[str(aid)] = ["SYSTEM_OWNED_QA: branding/text rules are owned by the campaign branding policy; "
+                                "remove this atom (or re-send it as a check about something else)"]
     return errors
 
 
@@ -295,12 +306,23 @@ def _budget_row(atom) -> dict:
             "channel": get("channel"), "shot": get("shot"), "text": str(get("text") or "")}
 
 
+_COLLAGE_WORDS = re.compile(r"\b(split[- ]?(frame|screen)|collage|grids?|panels?|side[- ]by[- ]side|diptych|triptych|"
+                            r"before[/ -]and[/ -]after (layout|collage))\b", re.I)
+
+
 def atom_budget_errors(atoms, shots: int) -> dict:
     """Return per-atom fixes and frame-level conflicts for redundant or over-budget MUST atoms."""
     rows = [_budget_row(a) for a in atoms]
     errors = {}
+    for row in rows:
+        if row["channel"] == "image" and _COLLAGE_WORDS.search(row["text"]):
+            errors[row["id"]] = [
+                "FRAME_COLLAGE_WORDING: do not write split frame / split-screen / panel / collage / grid / side-by-side; "
+                "image models turn them into a multi-panel collage. Describe ONE continuous surface or scene whose "
+                "left part is untreated and right part treated, with the tool at the boundary."]
     for shot in range(1, int(shots) + 1):
-        must = [r for r in rows if r["shot"] == shot and r["channel"] == "image" and r["priority"] == "MUST"]
+        must = [r for r in rows if r["shot"] == shot and r["channel"] == "image" and r["priority"] == "MUST"
+                and r["id"] not in errors]
 
         def protected(row):
             return row["id"].startswith(("mech_", "comp_"))
@@ -398,10 +420,9 @@ def validate_transfer_decision(decision, atoms) -> list:
 
 
 def build_request(offer, brief: str, shots: int, failed=None, source_transfer=None) -> dict:
-    branding_rule = brain_branding_rule(
-        getattr(offer, "branding_policy", TARGET_BRAND_ALLOWED),
-        getattr(offer, "approved_brand_marks", ()),
-    )
+    policy = getattr(offer, "branding_policy", TARGET_BRAND_ALLOWED)
+    branding_rule = brain_branding_rule(policy, resolved_brand_marks(
+        policy, getattr(offer, "approved_brand_marks", ()), getattr(offer, "name", ""), getattr(offer, "product_type", "")))
     req = {"schema": TRANSFER_ATOM_SCHEMA if source_transfer else ATOM_SCHEMA, "offer": offer.to_dict(), "brief": brief, "shots": shots,
            "rules": ["Return atoms only, no finished prompts.",
                      "Every kind='claim' atom must copy one verified claim verbatim and use channel='qa'; it records offer truth, not pixels.",
@@ -427,7 +448,7 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
             link_names = {link["link"] for link in links}
             if shots == 1 and {"problem", "result"}.issubset(link_names):
                 req["rules"].append(
-                    "ONE-SHOT COMPOSITION CONTRACT: because both problem and result must be visible in one frame, create an explicit additional MUST image atom with kind='scene', shot=1, and id prefix 'comp_'. Describe a concrete legible layout and locate the problem/result regions; do not copy an existing mech atom into comp_.")
+                    "ONE-SHOT COMPOSITION CONTRACT: because both problem and result must be visible in one frame, create an explicit additional MUST image atom with kind='scene', shot=1, and id prefix 'comp_'. Describe a concrete legible layout and locate the problem/result regions; do not copy an existing mech atom into comp_. Describe ONE continuous surface or scene (for example the left part untreated, the right part treated, the tool at the boundary); never use the words split frame, split-screen, panel, collage, grid or side-by-side.")
             elif shots >= 2:
                 req["rules"].append(
                     "MULTI-SHOT ROUTING CONTRACT: mech_problem_* and mech_intervention_* MUST image atoms go to shot 1; mech_result_* MUST image atoms go to shot 2.")

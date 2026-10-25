@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 from .atoms import check_claims, check_language, parse_atoms
-from .branding import allowed_brand_tokens
+from .branding import allowed_brand_tokens, resolved_brand_marks
 from .brain import (BrainError, TransferRejected, atom_budget_errors, build_source_transfer_context,
                     derive_mechanism_links, missing_mechanism_links, reserved_system_atom_errors,
                     validate_transfer_decision, visual_structure_errors, request_atoms)
@@ -217,14 +217,12 @@ def run_frame(args, offer, settings, catalog, vertical, log, run_id, ctx, out, a
             transfer_decision = json.loads(manifest_path.read_text(encoding="utf-8")).get("transfer_decision")
         except (OSError, ValueError):
             transfer_decision = None
-    approved_marks = offer.approved_brand_marks
-    if offer.branding_policy == "target_brand_allowed" and not approved_marks:
-        approved_marks = (offer.name,)
+    approved_marks = resolved_brand_marks(offer.branding_policy, offer.approved_brand_marks, offer.name, offer.product_type)
     qa = make_qa_checks(
         atoms, args.shot, judge_fn=judge, ocr_required=not args.no_ocr_required,
         verified_claims=offer.verified_claims, product_references=offer.photos,
         allowed_text=allowed_brand_tokens(
-            offer.branding_policy, offer.approved_brand_marks, offer.name, offer.product_type
+            offer.branding_policy, approved_marks, offer.name, offer.product_type
         ),
         transfer_decision=transfer_decision, branding_policy=offer.branding_policy,
         approved_brand_marks=approved_marks,
@@ -234,7 +232,7 @@ def run_frame(args, offer, settings, catalog, vertical, log, run_id, ctx, out, a
         receipt, compiled, verdict = produce_shot(
             offer=offer, atoms=atoms, shot=args.shot, contract_id=contract_id, state=state, out_dir=out,
             image_provider=provider, qa_checks=qa, attempt=args.attempt, refs=refs, vertical=vertical,
-            max_attempts=settings.max_attempts_per_shot)
+            max_attempts=settings.max_attempts_per_shot, reference_judge=judge)
     finally:
         save_state(state, out / "state.json")
     receipt_path = out / "receipts" / f"{receipt.receipt_id}.json"

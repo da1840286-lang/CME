@@ -241,6 +241,22 @@ def judge_batch_checks(path, atoms, judge_fn, required=False, reference_images=(
     return out
 
 
+REFERENCE_CHECK_ID = "reference_no_lettering"
+
+
+def check_reference_unbranded(path, judge_fn, shot=1):
+    """Independent pixel check of the image that will be sent to the generator as the product reference.
+    An empty OCR result never confirms a clean reference; only a Judge PASS does."""
+    from .branding import reference_lettering_rule
+    if judge_fn is None:
+        return CheckResult(REFERENCE_CHECK_ID, "NOT_RUN", True, "judge", "no Judge available to confirm the prepared reference")
+    atom = Atom(REFERENCE_CHECK_ID, "qa_check", reference_lettering_rule(), "MUST", "qa", shot)
+    for row in judge_batch_checks(path, [atom], judge_fn, required=True):
+        if row.check_id == REFERENCE_CHECK_ID:
+            return row
+    return CheckResult(REFERENCE_CHECK_ID, "NOT_RUN", True, "judge", "Judge returned no verdict for the reference")
+
+
 def make_qa_checks(atoms, shot, judge_fn=None, ocr=None, expected_size=None, ocr_required=True,
                    text_allowed=False, anchors=(), verified_claims=(), product_references=(), allowed_text=(),
                    transfer_decision=None, branding_policy=TARGET_BRAND_ALLOWED, approved_brand_marks=()):

@@ -6,7 +6,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from .compiler import BudgetError, compile_image_prompt
-from .branding import NO_BRANDING, prepare_unbranded_reference
+from .branding import NO_BRANDING, prepare_unbranded_reference, resolved_brand_marks
+from .qa import check_reference_unbranded
 from .atoms import check_claims, check_language
 from .receipt import assert_exact_payload, attach_qa, build_receipt, overall
 from .state import accept_shot, record_attempt
@@ -56,10 +57,21 @@ def _image_input_manifest(previous_refs, product_photos, generation_product_phot
             row["source_filename"] = source.name
             row["source_sha256"] = _file_sha256(source)
         if index < len(reports):
-            row["preparation"] = {"status": reports[index].get("status"),
-                                  "masked_regions": reports[index].get("masked_regions", 0)}
+            row["preparation"] = _preparation_record(reports[index])
         out.append(row)
     return out
+
+
+def _preparation_record(item: dict) -> dict:
+    """What the receipt keeps about reference preparation: outcome, evidence and the exact inputs."""
+    record = {"status": item.get("status"), "masked_regions": item.get("masked_regions", 0),
+              "rejected_regions": item.get("rejected_regions", 0), "residual_regions": item.get("residual_regions", 0),
+              "detected_words": list(item.get("detected_words") or [])[:12],
+              "source_sha256": item.get("source_sha256"), "prepared_sha256": item.get("prepared_sha256"),
+              "cached": bool(item.get("cached"))}
+    if item.get("verification"):
+        record["verification"] = dict(item["verification"])
+    return record
 
 
 def _commercial_status(provider_info: dict) -> str:
@@ -70,7 +82,7 @@ def _commercial_status(provider_info: dict) -> str:
 
 
 def produce_shot(*, offer, atoms, shot, contract_id, state, out_dir, image_provider, qa_checks,
-                 attempt=1, reserve=0, refs=(), vertical=None, max_attempts=0):
+                 attempt=1, reserve=0, refs=(), vertical=None, max_attempts=0, reference_judge=None):
     """image_provider(prompt, refs) -> png bytes. qa_checks(path) -> list[CheckResult]."""
     out = Path(out_dir)
     state.bind(offer.offer_id, contract_id)
@@ -100,7 +112,8 @@ def produce_shot(*, offer, atoms, shot, contract_id, state, out_dir, image_provi
     try:
         compiled = compile_image_prompt(
             atoms, shot, reserve=reserve, branding_policy=offer.branding_policy,
-            approved_brand_marks=offer.approved_brand_marks,
+            approved_brand_marks=resolved_brand_marks(offer.branding_policy, offer.approved_brand_marks,
+                                                      offer.name, offer.product_type),
         )
     except BudgetError as e:
         _blocked(state, out, shot, attempt, "BLOCKED_BUDGET", str(e))
@@ -120,6 +133,33 @@ def produce_shot(*, offer, atoms, shot, contract_id, state, out_dir, image_provi
                 )
                 _blocked(state, out, shot, attempt, "BLOCKED_BRANDING_REFERENCE", detail)
                 raise GateError([detail])
+            if report.get("status") == "MASK_INCOMPLETE":
+                detail = (f"no_branding could not remove lettering from target reference {Path(source).name}: "
+                          f"{report.get('residual_regions', 0)} region(s) still read as text after masking "
+                          f"({', '.join(report.get('detected_words', [])[:6])}); supply a clean product photo")
+                _blocked(state, out, shot, attempt, "BLOCKED_BRANDING_REFERENCE", detail)
+                raise GateError([detail])
+            # An empty OCR result is not proof of a clean image: only an independent visual check confirms it.
+            verdict = report.get("verification") or check_reference_unbranded(report["path"], reference_judge, shot)
+            if hasattr(verdict, "status"):
+                report["verification"] = {"status": verdict.status, "evidence": str(verdict.detail)[:200]}
+            if report["verification"]["status"] != "PASS":
+                why = ("lettering is still visible: " if report["verification"]["status"] == "FAIL"
+                       else "the prepared reference could not be confirmed: ")
+                detail = (f"no_branding blocked generation for target reference {Path(source).name}; {why}"
+                          f"{report['verification']['evidence']} (preparation: {report.get('status')}, "
+                          f"{report.get('masked_regions', 0)} region(s) masked). Supply a clean product photo "
+                          "or use target_brand_allowed.")
+                _blocked(state, out, shot, attempt, "BLOCKED_BRANDING_REFERENCE", detail)
+                raise GateError([detail])
+            if report["verification"]["status"] == "PASS" and Path(report["path"]).with_suffix(".prep.json").is_file():
+                sidecar = Path(report["path"]).with_suffix(".prep.json")
+                try:
+                    cached = json.loads(sidecar.read_text(encoding="utf-8"))
+                    cached["verification"] = report["verification"]
+                    sidecar.write_text(json.dumps(cached, ensure_ascii=False, indent=1), encoding="utf-8")
+                except (OSError, ValueError):
+                    pass
             provider_product_refs[index-1] = report["path"]
 
     receipt = build_receipt(contract_id, state.run_id, shot, attempt, atoms, compiled.text)
@@ -130,9 +170,7 @@ def produce_shot(*, offer, atoms, shot, contract_id, state, out_dir, image_provi
     base = {"lost": compiled.lost_line(), "ad_requirements": list(ad_requirements),
             "provider": {}, "commercial_status": "TEST_ONLY",
             "branding_policy": offer.branding_policy,
-            "reference_preparation": [{"status": item.get("status"),
-                                       "masked_regions": item.get("masked_regions", 0)}
-                                      for item in preparation_reports],
+            "reference_preparation": [_preparation_record(item) for item in preparation_reports],
             "image_inputs": _image_input_manifest(
                 refs, offer.photos, provider_product_refs, preparation_reports, offer.branding_policy
             )}

@@ -1,5 +1,6 @@
 """Regression tests for campaign-scoped branding across Brain, image prompt and QA."""
 import json
+import shutil
 import tempfile
 import unittest
 from dataclasses import replace
@@ -14,6 +15,7 @@ from cme.offer import load_offer
 from cme.qa import CheckResult, SYSTEM_NO_TEXT_ID, make_qa_checks
 from cme.run import produce_shot
 from cme.state import new_run
+from cme.vertical import GateError
 from tests.helpers import A, png_bytes
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -82,47 +84,149 @@ class CampaignBrandingPolicyTests(unittest.TestCase):
             self.assertTrue(rows[SYSTEM_NO_TEXT_ID].required)
             self.assertEqual(rows[SYSTEM_NO_TEXT_ID].status, "FAIL")
 
-    def test_reference_text_is_masked_but_original_is_preserved(self):
+    @unittest.skipUnless(shutil.which("tesseract"), "tesseract not installed")
+    def test_real_lettering_is_removed_and_the_original_is_preserved(self):
+        font = _font()
+        if font is None:
+            self.skipTest("no TrueType font")
         with tempfile.TemporaryDirectory() as d:
-            source = Path(d) / "product.jpg"
-            out = Path(d) / "out"
-            image = Image.new("RGB", (160, 100), (15,15,15))
-            ImageDraw.Draw(image).text((25,35), "Fanttik", fill=(245,245,245))
+            source = Path(d) / "product.png"
+            image = Image.new("RGB", (640, 360), (255, 255, 255))
+            draw = ImageDraw.Draw(image)
+            draw.rounded_rectangle((40, 90, 600, 270), 40, fill=(22, 22, 22))     # product body
+            draw.ellipse((470, 150, 530, 210), outline=(0, 190, 200), width=8)     # a coloured control that must survive
+            draw.text((90, 135), "FANTTIK", font=font, fill=(250, 215, 0))
             image.save(source)
-            response = {"text":["Fanttik"],"conf":["96"],"left":["25"],"top":["35"],"width":["65"],"height":["14"]}
-            with patch("pytesseract.image_to_data", return_value=response):
-                prepared = prepare_unbranded_reference(source, out / "clean.png")
-            self.assertEqual(prepared["status"], "TEXT_REGIONS_MASKED")
+            before = image.copy()
+            prepared = prepare_unbranded_reference(source, Path(d) / "out" / "clean.png")
+            self.assertEqual(prepared["status"], "TEXT_REGIONS_MASKED", prepared)
+            self.assertEqual(prepared["residual_regions"], 0)
             with Image.open(source) as original, Image.open(prepared["path"]) as clean:
-                self.assertNotEqual(list(original.getdata()), list(clean.getdata()))
+                self.assertEqual(list(original.getdata()), list(before.getdata()), "the original must stay untouched")
+                clean = clean.convert("RGB")
+                yellow = sum(1 for px in clean.crop((80, 120, 460, 220)).getdata() if px[0] > 200 and px[1] > 170 and px[2] < 80)
+                self.assertLess(yellow, 40, "letters should be gone")
+                self.assertEqual(clean.getpixel((20, 20)), (255, 255, 255), "plain background must stay as it was")
+                teal = sum(1 for px in clean.crop((460, 140, 540, 220)).getdata() if px[1] > 150 and px[2] > 150 and px[0] < 60)
+                self.assertGreater(teal, 150, "product detail outside the lettering must survive")
+            again = prepare_unbranded_reference(source, Path(d) / "out" / "clean.png")
+            self.assertTrue(again["cached"])
 
-    def test_generator_receives_scrubbed_ref_and_receipt_records_policy(self):
+    def test_multicolour_regions_are_left_alone(self):
+        from cme.branding import _letter_mask
+        image = Image.new("RGB", (200, 120), (20, 20, 20))
+        draw = ImageDraw.Draw(image)
+        for i in range(0, 200, 8):                                               # photo-like product detail
+            draw.rectangle((i, 30, i + 6, 90), fill=((i * 5) % 255, (i * 11) % 255, (i * 17) % 255))
+        mask, _surface = _letter_mask(image, [[(0, 20), (200, 20), (200, 100), (0, 100)]])
+        self.assertIsNone(mask)
+
+    def _prepared_stub(self, d, status="TEXT_REGIONS_MASKED", **extra):
+        def prepare(source, destination):
+            destination = Path(destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(png_bytes())
+            return {"path": str(destination), "status": status, "masked_regions": 1, "residual_regions": 0,
+                    "detected_words": ["Fanttik"], "source_sha256": "a" * 64, "prepared_sha256": "b" * 64, **extra}
+        return prepare
+
+    def _run(self, d, judge, status="TEXT_REGIONS_MASKED", **extra):
+        source = Path(d) / "target.png"
+        Image.new("RGB", (160, 100), (15, 15, 15)).save(source)
+        offer = replace(load_offer(EX), photos=(str(source),), branding_policy=NO_BRANDING)
+        calls = []
+
+        def provider(prompt, images):
+            calls.append((prompt, list(images)))
+            return png_bytes()
+        with patch("cme.run.prepare_unbranded_reference", side_effect=self._prepared_stub(d, status, **extra)):
+            result = produce_shot(
+                offer=offer, atoms=[A("product_main", "Black handheld vacuum body is visible", kind="product")],
+                shot=1, contract_id="branding-test-contract", state=new_run("branding-test-run"),
+                out_dir=Path(d) / "out", image_provider=provider,
+                qa_checks=lambda _p: [CheckResult("file", "PASS", True, "code")], reference_judge=judge)
+        return result, calls, source
+
+    @staticmethod
+    def _judge(passed, evidence="no lettering visible"):
+        def judge(_path, atoms):
+            return {a.id: {"pass": passed, "evidence": evidence} for a in atoms}
+        return judge
+
+    def test_generator_receives_confirmed_reference_and_receipt_records_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            (receipt, _, _), calls, source = self._run(d, self._judge(True))
+            self.assertEqual(len(calls), 1)
+            self.assertNotEqual(Path(calls[0][1][0]).resolve(), source.resolve())
+            self.assertIn("no_branding", calls[0][0])
+            self.assertIn("FRAME FORM", calls[0][0])
+            data = json.loads((Path(d) / "out" / "receipts" / f"{receipt.receipt_id}.json").read_text())
+            self.assertEqual(data["branding_policy"], NO_BRANDING)
+            row = data["image_inputs"][0]
+            self.assertEqual(row["role"], "target_product_photo_unbranded_reference")
+            self.assertEqual(row["source_filename"], "target.png")
+            self.assertEqual(row["preparation"]["status"], "TEXT_REGIONS_MASKED")
+            self.assertEqual(row["preparation"]["verification"]["status"], "PASS")
+            self.assertEqual(row["preparation"]["detected_words"], ["Fanttik"])
+            self.assertEqual(data["reference_preparation"][0]["prepared_sha256"], "b" * 64)
+
+    def test_no_text_found_is_not_proof_the_reference_is_clean(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(GateError) as cm:
+                self._run(d, self._judge(False, "yellow wordmark Fanttik visible on the body"), status="NO_CONFIDENT_TEXT_FOUND")
+            self.assertIn("still visible", str(cm.exception))
+            self.assertIn("Fanttik", str(cm.exception))
+            blocked = list((Path(d) / "out" / "receipts").glob("blocked_*.json"))
+            self.assertEqual(len(blocked), 1)
+            self.assertEqual(json.loads(blocked[0].read_text())["overall"], "BLOCKED_BRANDING_REFERENCE")
+
+    def test_generation_is_blocked_when_nothing_can_confirm_the_reference(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(GateError) as cm:
+                self._run(d, None)
+            self.assertIn("could not be confirmed", str(cm.exception))
+
+    def test_unavailable_or_malformed_judge_blocks(self):
+        def broken(_path, _atoms):
+            raise TimeoutError("504 upstream idle timeout")
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(GateError):
+                self._run(d, broken)
+
+    def test_incomplete_mask_blocks_before_any_provider_call(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(GateError) as cm:
+                self._run(d, self._judge(True), status="MASK_INCOMPLETE", residual_regions=2)
+            self.assertIn("still read as text", str(cm.exception))
+
+    def test_target_brand_allowed_needs_no_reference_cleaning(self):
         with tempfile.TemporaryDirectory() as d:
             source = Path(d) / "target.png"
-            image = Image.new("RGB", (160,100), (15,15,15))
-            ImageDraw.Draw(image).text((25,35), "Fanttik", fill=(245,245,245))
-            image.save(source)
-            offer = replace(load_offer(EX), photos=(str(source),), branding_policy=NO_BRANDING)
-            refs, prompts = [], []
-            def fake_ocr(_image, *, config, output_type):
-                return {"text":["Fanttik"],"conf":["96"],"left":["25"],"top":["35"],"width":["65"],"height":["14"]}
-            def provider(prompt, images):
-                prompts.append(prompt); refs.extend(images); return png_bytes()
-            with patch("pytesseract.image_to_data", side_effect=fake_ocr):
-                receipt, _, _ = produce_shot(
-                    offer=offer, atoms=[A("product_main","Black handheld vacuum body is visible",kind="product")],
-                    shot=1, contract_id="branding-test-contract", state=new_run("branding-test-run"),
-                    out_dir=Path(d)/"out", image_provider=provider,
-                    qa_checks=lambda _p:[CheckResult("file","PASS",True,"code")])
-            self.assertEqual(len(refs), 1)
-            self.assertNotEqual(Path(refs[0]).resolve(), source.resolve())
-            self.assertTrue(Path(refs[0]).is_file())
-            self.assertIn("no_branding", prompts[0])
-            data=json.loads((Path(d)/"out"/"receipts"/f"{receipt.receipt_id}.json").read_text())
-            self.assertEqual(data["branding_policy"], NO_BRANDING)
-            self.assertEqual(data["image_inputs"][0]["role"], "target_product_photo_unbranded_reference")
-            self.assertEqual(data["image_inputs"][0]["preparation"]["status"], "TEXT_REGIONS_MASKED")
-            self.assertEqual(data["image_inputs"][0]["source_filename"], "target.png")
+            Image.new("RGB", (160, 100), (15, 15, 15)).save(source)
+            offer = replace(load_offer(EX), photos=(str(source),), branding_policy=TARGET_BRAND_ALLOWED)
+            seen = []
+            with patch("cme.run.prepare_unbranded_reference", side_effect=AssertionError("must not run")):
+                produce_shot(offer=offer, atoms=[A("product_main", "Black handheld vacuum body is visible", kind="product")],
+                             shot=1, contract_id="c", state=new_run("r"), out_dir=Path(d) / "out",
+                             image_provider=lambda prompt, images: (seen.append(list(images)), png_bytes())[1],
+                             qa_checks=lambda _p: [CheckResult("file", "PASS", True, "code")])
+            self.assertEqual(Path(seen[0][0]).resolve(), source.resolve())
+
+    def test_marks_are_resolved_once_for_every_stage(self):
+        from cme.branding import resolved_brand_marks
+        self.assertEqual(resolved_brand_marks(NO_BRANDING, ("Fanttik",), "Fanttik V8 Mate Cordless Car Vacuum", "cordless handheld car vacuum"), ())
+        self.assertEqual(resolved_brand_marks(TARGET_BRAND_ALLOWED, ("Fanttik",), "x", "y"), ("Fanttik",))
+        self.assertEqual(resolved_brand_marks(TARGET_BRAND_ALLOWED, (), "Fanttik V8 Mate Cordless Car Vacuum", "cordless handheld car vacuum"),
+                         ("Fanttik V8 Mate",))
+
+
+def _font():
+    from PIL import ImageFont
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 72)
+    except OSError:
+        return None
+
 
 if __name__ == "__main__":
     unittest.main()

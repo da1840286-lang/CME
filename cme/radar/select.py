@@ -123,19 +123,36 @@ def select_pattern_candidate(candidates):
     return None, skipped
 
 
+STRONG_SOURCE_BONUS = 5.0       # soft preference for sources that also pass the commercial check
+RELEVANCE_TIEBREAK = {"DIRECT": 2, "EXPANDED": 1}
+
+
+def _score(item) -> float:
+    score = (item.get("source_score") or {}) if isinstance(item, dict) else {}
+    try:
+        return float(score.get("final_score") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def rank_transfer_candidates(candidates):
-    """Put commercially approved sources first; retain usable weaker sources in FIND order."""
-    strong, other, skipped = [], [], []
-    for item in candidates or []:
+    """Usable sources ordered by score, with a soft bonus (not a gate) for commercially approved ones.
+
+    A pattern can come from any playable, non-excluded ad, but a higher-scoring source is the better bet. Within
+    the same adjusted score a source closer to the target category goes first; remaining ties keep FIND order.
+    """
+    usable, skipped = [], []
+    for position, item in enumerate(candidates or []):
         reason = pattern_source_reason(item)
         if reason:
             candidate_id = item.get("id") if isinstance(item, dict) else "<invalid>"
             skipped.append(f"{candidate_id}: {reason}")
-        elif not block_reason(item):
-            strong.append(item)
-        else:
-            other.append(item)
-    return strong + other, skipped
+            continue
+        adjusted = _score(item) + (0.0 if block_reason(item) else STRONG_SOURCE_BONUS)
+        relevance = RELEVANCE_TIEBREAK.get(str((item.get("source_check") or {}).get("classification", "")).upper(), 0)
+        usable.append((-adjusted, -relevance, position, item))
+    usable.sort(key=lambda row: row[:3])
+    return [row[3] for row in usable], skipped
 
 
 def select_transfer_candidate(candidates):
