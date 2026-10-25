@@ -159,8 +159,17 @@ class MechanismCoverageTests(unittest.TestCase):
             (root / "settings.json").write_text((ROOT / "settings.example.json").read_text(encoding="utf-8"), encoding="utf-8")
             (root / "src.json").write_text(json.dumps(RADAR), encoding="utf-8")
 
+            fit_decision = {"transferable": True,
+                            "abstract_mechanism": transfer_decision()["abstract_mechanism"],
+                            "target_native_mapping": "Show a target product fixing a visible problem and prove the result",
+                            "target_evidence": ["kitchen storage"],
+                            "reason": "The target can demonstrate a familiar task and visible improvement"}
             def transport(method, url, headers, payload):
-                body = {"model": payload["model"], "choices": [{"message": {"content": json.dumps({"atoms": FULL, "transfer_decision": transfer_decision()})}}]}
+                user_payload = json.loads(payload["messages"][1]["content"])
+                answer = ({"atoms": [], "transfer_decision": fit_decision}
+                          if user_payload.get("task") == "target_fit_gate"
+                          else {"atoms": FULL, "transfer_decision": transfer_decision()})
+                body = {"model": payload["model"], "choices": [{"message": {"content": json.dumps(answer)}}]}
                 return 200, json.dumps(body).encode()
             out = root / "out"
             code = smoke_main(["brain", "--settings", str(root / "settings.json"), "--out", str(out),

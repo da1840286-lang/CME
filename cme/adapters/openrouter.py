@@ -92,12 +92,15 @@ def make_openrouter_brain(params: dict, api_key=None, transport=None):
     send = transport or urllib_transport
 
     def call(request: dict):
-        root_shape = '{"atoms": [...], "transfer_decision": {...}}' if request.get("source_transfer") else '{"atoms": [...]}'
+        if request.get("task") == "target_fit_gate":
+            root_shape = '{"atoms": [], "transfer_decision": {...}}'
+        else:
+            root_shape = '{"atoms": [...], "transfer_decision": {...}}' if request.get("source_transfer") else '{"atoms": [...]}'
         system = ("You are the Brain of an ad production system. Reply with ONE JSON object " + root_shape + " "
                   "and nothing else. Each atom: id, kind, text (max 120 chars), priority (MUST/SHOULD/MAY), "
                   f"channel (image/motion/qa), shot. Allowed kinds: {', '.join(KINDS)}. "
                   + " ".join(request.get("rules", [])) + " JSON schema: " + json.dumps(request["schema"]))
-        user = {k: request.get(k) for k in ("offer", "brief", "shots", "only_fix", "source_transfer", "mechanism_links") if request.get(k) is not None}
+        user = {k: request.get(k) for k in ("task", "offer", "brief", "shots", "only_fix", "source_transfer", "mechanism_links") if request.get(k) is not None}
         content, meta = _chat(params, api_key, send,
                               [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user)}],
                               _format(params, request.get("schema", ATOM_SCHEMA)))

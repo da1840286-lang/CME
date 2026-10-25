@@ -118,9 +118,17 @@ class SourceTransferBridgeTests(unittest.TestCase):
             source_path = root / "old_contract.json"
             source_path.write_text(json.dumps(self.old_contract()), encoding="utf-8")
             sent = []
+            fit_decision = {"transferable": True,
+                            "abstract_mechanism": DECISION["abstract_mechanism"],
+                            "target_native_mapping": "Show the target product solving a recognizable task with visible proof",
+                            "target_evidence": ["kitchen storage"],
+                            "reason": "The target offer can demonstrate a problem and inspectable improvement"}
             def transport(method, url, headers, payload):
                 sent.append(payload)
-                answer = {"atoms": [GOOD], "transfer_decision": DECISION}
+                user_payload = json.loads(payload["messages"][1]["content"])
+                answer = ({"atoms": [], "transfer_decision": fit_decision}
+                          if user_payload.get("task") == "target_fit_gate"
+                          else {"atoms": [GOOD], "transfer_decision": DECISION})
                 response = {"model": payload["model"], "choices": [{"message": {"content": json.dumps(answer)}}]}
                 return 200, json.dumps(response).encode()
             out = root / "out"
@@ -132,6 +140,8 @@ class SourceTransferBridgeTests(unittest.TestCase):
             self.assertEqual(user["source_transfer"]["mechanism"]["canonical_slug"], "demonstrate-then-prove")
             manifest = json.loads((out / "atoms_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["source_contract_sha256"], hashlib.sha256(source_path.read_bytes()).hexdigest())
+            self.assertTrue(manifest["target_fit_gate"]["transferable"])
+            self.assertTrue((out / "target_fit_gate.json").is_file())
 
     def test_openrouter_sends_optional_source_transfer_as_a_distinct_payload_field(self):
         ctx = build_source_transfer_context(self.old_contract())

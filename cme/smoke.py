@@ -17,7 +17,7 @@ from .atoms import check_claims, check_language, parse_atoms
 from .branding import allowed_brand_tokens, resolved_brand_marks
 from .brain import (BrainError, TransferRejected, atom_budget_errors, build_source_transfer_context,
                     derive_mechanism_links, missing_mechanism_links, reserved_system_atom_errors,
-                    validate_transfer_decision, visual_structure_errors, request_atoms)
+                    validate_transfer_decision, visual_structure_errors, request_atoms, request_transfer_fit)
 from .compiler import BudgetError
 from .offer import OfferError, load_offer
 from .providers import CallLog, InfraError, ProviderCallError, ProviderPolicyError
@@ -153,6 +153,16 @@ def run_brain(args, offer, settings, catalog, vertical, log, run_id, ctx, out):
     manifest_path.unlink(missing_ok=True)
     atoms_path.unlink(missing_ok=True)
     call = make_brain_call(settings, catalog, log, run_id, **ctx)
+    target_fit_gate = None
+    if source_transfer is not None:
+        # Gate before atom generation: an incompatible source should be rejected without
+        # spending a second model call on a production contract. Preserve the decision as an audit artifact.
+        target_fit_gate = request_transfer_fit(offer, args.brief, source_transfer, call)
+        (out / "target_fit_gate.json").write_text(
+            json.dumps(target_fit_gate, ensure_ascii=False, indent=2), encoding="utf-8")
+        if target_fit_gate.get("transferable") is not True:
+            raise TransferRejected(target_fit_gate)
+        source_transfer = {**source_transfer, "target_fit_gate": target_fit_gate}
     transfer_decision = {}
     atoms = request_atoms(offer, args.brief, args.shots, call, vertical=vertical,
                           source_transfer=source_transfer, decision_out=transfer_decision)
@@ -164,6 +174,7 @@ def run_brain(args, offer, settings, catalog, vertical, log, run_id, ctx, out):
                 "photo_hashes": photo_hashes, "contract_id": contract_id_for(data, offer),
                 "requested_shots": args.shots,
                 "mechanism_links": [l["link"] for l in derive_mechanism_links(source_transfer)],
+                "target_fit_gate": target_fit_gate,
                 "brief_sha256": _sha256_bytes(args.brief.encode("utf-8")),
                 "source_contract_sha256": _sha256_bytes(Path(args.source_contract).read_bytes()) if args.source_contract else None,
                 "model_id": call.info.get("model_id"), "responded_model": call.info.get("responded_model")}
@@ -333,6 +344,7 @@ def main(argv=None, ctx=None) -> int:
         error_text=json.dumps(e.errors,ensure_ascii=False)
         failure_class=("VISUAL_CONTRACT_INVALID" if any(t in error_text for t in ("COMPOSITION_REQUIRED","MECHANISM_SHOT_ORDER","SYSTEM_OWNED_QA","transfer_decision")) else "BRAIN_OUTPUT_INVALID")
         write_run_result(out,args.command,4,failure_class,message)
+        return 4
     except ProviderCallError as e:
         message=f"Провайдер ответил ошибкой: {e}"; print(message); write_run_result(out,args.command,5,"PROVIDER_RESPONSE_ERROR",message); return 5
     if args.command == "brain":

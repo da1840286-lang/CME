@@ -376,6 +376,104 @@ class TransferRejected(BrainError):
 
 _CYRILLIC = re.compile("[\\u0400-\\u04ff]")
 
+# The transfer gate runs before atom authoring. It intentionally shares the Brain
+# provider, but uses a separate strict contract so an invalid atom budget cannot hide
+# whether the source mechanism is transferable. The gate never returns production atoms.
+TRANSFER_FIT_SCHEMA = {
+    "type": "object",
+    "required": ["atoms", "transfer_decision"],
+    "additionalProperties": False,
+    "properties": {
+        "atoms": {"type": "array", "maxItems": 0},
+        "transfer_decision": {
+            "type": "object",
+            "required": ["transferable", "abstract_mechanism", "target_native_mapping", "target_evidence", "reason"],
+            "additionalProperties": False,
+            "properties": {
+                "transferable": {"type": "boolean"},
+                "abstract_mechanism": {"type": "string", "minLength": 10, "maxLength": 200},
+                "target_native_mapping": {"type": "string", "minLength": 10, "maxLength": 240},
+                "target_evidence": {"type": "array", "maxItems": 3, "items": {"type": "string", "minLength": 8, "maxLength": 120}},
+                "reason": {"type": "string", "minLength": 10, "maxLength": 240},
+            },
+        },
+    },
+}
+
+
+def _normalized_evidence(value: str) -> str:
+    """Normalize punctuation/case for exact, ordered evidence matching against the OfferCard."""
+    return re.sub(r"[^\w]+", " ", str(value or "").casefold(), flags=re.UNICODE).strip()
+
+
+def validate_transfer_fit_decision(offer, decision) -> list:
+    """Fail closed unless the transfer verdict is well-formed and its target evidence is real."""
+    if not isinstance(decision, dict):
+        return ["transfer-fit decision is missing or is not an object"]
+    errors = []
+    if type(decision.get("transferable")) is not bool:
+        errors.append("transfer_decision.transferable must be a boolean")
+    for key, minimum, maximum in (("abstract_mechanism", 10, 200),
+                                  ("target_native_mapping", 10, 240),
+                                  ("reason", 10, 240)):
+        value = decision.get(key)
+        if not isinstance(value, str) or not minimum <= len(value.strip()) <= maximum:
+            errors.append(f"transfer_decision.{key} must contain {minimum}-{maximum} characters")
+        elif _CYRILLIC.search(value):
+            errors.append(f"transfer_decision.{key} must be in English")
+    evidence = decision.get("target_evidence")
+    if not isinstance(evidence, list) or len(evidence) > 3 or any(
+        not isinstance(item, str) or not 8 <= len(item.strip()) <= 120 for item in (evidence or [])
+    ):
+        errors.append("transfer_decision.target_evidence must be a list of 0-3 evidence excerpts, each 8-120 characters")
+        evidence = []
+    if decision.get("transferable") is True and not evidence:
+        errors.append("a transferable decision requires target_evidence copied from the OfferCard")
+
+    allowed = [getattr(offer, "name", ""), getattr(offer, "product_type", ""),
+               getattr(offer, "product_category", ""), *getattr(offer, "verified_claims", ()),
+               *getattr(offer, "confirmations", ())]
+    allowed_normalized = [_normalized_evidence(item) for item in allowed if str(item or "").strip()]
+    for index, item in enumerate(evidence):
+        if not isinstance(item, str):
+            continue
+        needle = _normalized_evidence(item)
+        if not needle or not any(needle in haystack for haystack in allowed_normalized):
+            errors.append(f"transfer_decision.target_evidence[{index}] is not present in authoritative OfferCard fields")
+    return errors
+
+
+def request_transfer_fit(offer, brief: str, source_transfer: dict, call) -> dict:
+    """Run the pre-generation fit gate. A bad/uncertain response blocks atom generation."""
+    request = {
+        "task": "target_fit_gate",
+        "schema": TRANSFER_FIT_SCHEMA,
+        "offer": offer.to_dict(),
+        "brief": brief,
+        "source_transfer": source_transfer,
+        "rules": [
+            "This is a transferability gate only. Return atoms=[]; do not write image atoms or an ad prompt.",
+            "Judge the source's causal commercial mechanism, not superficial product similarity, source score, generic ease/speed language, or CTA.",
+            "Cross-category transfer is allowed only when you can explain how the same causal persuasion mechanism maps to a real target-native problem, intervention and observable proof.",
+            "The current OfferCard is authoritative for target facts. The sampled source analysis is a hypothesis, not full-video or performance proof. Never transfer source-only hardware or features without target evidence.",
+            "For transferable=true, target_evidence must contain 1-3 verbatim excerpts copied from OfferCard name, product_type, product_category, verified_claims, or confirmations. No source-ad text and no invented target facts.",
+            "A shared generic desire (easy, fast, fewer cables, convenient) is not sufficient if the actual causal intervention from the source cannot be demonstrated by this target product. If evidence is missing or you are uncertain, choose transferable=false.",
+            "Return transfer_decision with transferable, abstract_mechanism, target_native_mapping, target_evidence, and reason. Explain the source-specific causal mechanism and how the target can or cannot demonstrate it.",
+        ],
+    }
+    response = call(request)
+    if not isinstance(response, dict) or response.get("_error"):
+        detail = response.get("_error") if isinstance(response, dict) else "response is not a JSON object"
+        raise BrainError({"#transfer_fit": [f"target-fit gate returned invalid output: {detail or 'missing response'}"]})
+    if response.get("atoms") != []:
+        raise BrainError({"#transfer_fit": ["target-fit gate must return atoms=[]; production atoms are forbidden at this stage"]})
+    decision = response.get("transfer_decision")
+    errors = validate_transfer_fit_decision(offer, decision)
+    if errors:
+        raise BrainError({"#transfer_fit": errors})
+    return {key: decision[key] for key in
+            ("transferable", "abstract_mechanism", "target_native_mapping", "target_evidence", "reason")}
+
 
 def validate_transfer_decision(decision, atoms) -> list:
     """Validate the decision and require every preserved property to have a MUST image carrier."""
@@ -437,6 +535,14 @@ def build_request(offer, brief: str, shots: int, failed=None, source_transfer=No
                      "Frame budget: at most %d MUST image atoms per shot; use only one layout atom per shot; do not repeat the same visible requirement in a scene, action and mechanism atom. The mech_* atom carries the idea; other atoms add only distinct requirements." % MAX_MUST_IMAGE_PER_SHOT]}
     if source_transfer:
         req["source_transfer"] = source_transfer
+        fit_gate = source_transfer.get("target_fit_gate") if isinstance(source_transfer, dict) else None
+        if isinstance(fit_gate, dict):
+            req["rules"].append(
+                "MANDATORY PRE-APPROVED TARGET-FIT GATE: the independent gate already approved this exact abstract mechanism: "
+                + str(fit_gate.get("abstract_mechanism") or "") + ". Do not broaden it into generic convenience, speed, or ease; "
+                "build the target-native creative only around that approved causal mechanism and its target_native_mapping: "
+                + str(fit_gate.get("target_native_mapping") or "") + ". Keep target_evidence grounded in the OfferCard. If this exact mechanism "
+                "cannot be visibly preserved, return transfer_decision.transferable=false rather than silently substituting a different idea.")
         links = derive_mechanism_links(source_transfer)
         if links:
             req["mechanism_links"] = links
@@ -535,6 +641,10 @@ def request_atoms(offer, brief: str, shots: int, call, max_retries: int = 2, ver
         if source_transfer:
             candidate_decision = offered if isinstance(offered, dict) else held_decision
             decision_errors = validate_transfer_decision(candidate_decision, by_id.values())
+            fit_gate = source_transfer.get("target_fit_gate") if isinstance(source_transfer, dict) else None
+            if isinstance(fit_gate, dict) and isinstance(candidate_decision, dict) and candidate_decision.get("transferable") is True:
+                if _normalized_evidence(candidate_decision.get("abstract_mechanism", "")) != _normalized_evidence(fit_gate.get("abstract_mechanism", "")):
+                    decision_errors.append("transfer_decision.abstract_mechanism must preserve the independently approved target-fit mechanism exactly")
             if decision_errors:
                 pending["#transfer_decision"] = decision_errors
                 held_decision = None
