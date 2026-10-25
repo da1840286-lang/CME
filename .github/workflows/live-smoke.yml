@@ -661,7 +661,7 @@ jobs:
                           brand = str(c.get("brand") or "unknown brand")[:80]
                           url = c.get("source_url") if isinstance(c.get("source_url"), str) and str(c.get("source_url")).startswith("https://") else ""
                           summary.write(f"- candidate_id: {c['id']} — {brand}: {title}; score={c.get('final_score')}; video={'yes' if c.get('video_url_present') else 'no'}; {url}\n")
-                      summary.write("\nRelevance and commercial scores are retained as ranking/evidence metadata, not hard transfer gates. Commercially strong sources are tried first. If analysis fails because a video's unavailable, the Analyst provider errors, or model output is invalid, CME tries the next eligible source, up to three candidates. An explicit candidate_id is never replaced automatically.\n")
+                      summary.write("\nAutomatic transfer uses only candidates passing the strict source-commercial gate; scorer REJECT and failed money-signal candidates are skipped even if their videos are playable. On INVALID_OUTPUT, CME retries the same candidate once before advancing to the next eligible source, up to three distinct candidates. An explicit candidate_id is never replaced automatically.\n")
               candidates = json.loads(candidates_file.read_text(encoding="utf-8")).get("candidates", [])
               candidate, skipped = select_transfer_candidate(candidates)
               candidate_pool, ranked_skipped = rank_transfer_candidates(candidates)
@@ -681,7 +681,7 @@ jobs:
                                f"hard_excluded={stats.get('pre_visual_verification_hard_excluded_ads', 0)}; "
                                f"sponsored_queries={tried}. ")
                   skip_text = "; ".join(skipped[:5]) or "FIND returned no ranked candidates to evaluate."
-                  raise SystemExit("FIND returned no usable pattern source (requires a video and no hard exclusion): "
+                  raise SystemExit("FIND returned no commercially eligible transfer source (requires a video, no hard exclusion, and a strict source-commercial pass): "
                                    + skip_text + " " + diagnosis + "No analyst/generator calls were made.")
               selection_mode = "automatic_best_valid_ranked"
 
@@ -701,6 +701,7 @@ jobs:
               final_analysis = {}
               final_saved = {}
 
+              stop_candidate_search = False
               for source in candidate_pool[:analysis_limit]:
                   cid = str(source.get("id") or "").strip()
                   if not cid:
@@ -714,37 +715,47 @@ jobs:
                   reason = ("Selected manually from GitHub Actions FIND" if selection_mode == "manual_from_prior_find"
                             else "Eligible automatic source tried in FIND ranking order")
                   app.store.decide(cid, "shortlist", reason)
-                  try:
-                      status = app.do_analyze(cid)
-                  except Exception as exc:
-                      # Unexpected implementation/configuration errors are recorded and stop fallback.
-                      status = {"status": "INTERNAL_ERROR", "detail": f"{type(exc).__name__}: {exc}"}
-                  saved_rows = app.store.analyses(cid)
-                  saved = saved_rows[0] if saved_rows else {}
-                  score = source.get("source_score") or {}
-                  score = score if isinstance(score, dict) else {}
-                  components = score.get("components") or {}
-                  components = components if isinstance(components, dict) else {}
-                  money_gate = components.get("money_signal_gate") or {}
-                  money_gate = money_gate if isinstance(money_gate, dict) else {}
-                  analysis = {"candidate_id": cid, "analysis_id": status.get("analysis_id"),
-                              "status": status.get("status"), "selection_mode": selection_mode,
-                              "source_use_policy": "PATTERN_EXTRACTION_NOT_COMMERCIAL_APPROVAL",
-                              "commercial_gate_passed": bool(money_gate.get("pass")),
-                              "source_relevance": (source.get("source_check") or {}).get("classification", "UNKNOWN"),
-                              "source_score": score.get("final_score"),
-                              "source_evidence_scope": "six sampled video frames only; mechanism and transferability remain hypotheses",
-                              "result": saved.get("result"), "warnings": status.get("warnings", []),
-                              "detail": status.get("detail", "")}
-                  attempt = {"candidate_id": cid, "status": str(status.get("status") or "UNKNOWN").upper(),
-                             "detail": str(status.get("detail") or "")[:500]}
-                  attempts.append(attempt)
-                  print(f"Source analysis: candidate={cid} status={attempt['status']} detail={attempt['detail']}")
-                  final_status, final_analysis, final_saved = status, analysis, saved
-                  if attempt["status"] == "OK":
-                      selected_candidate = source
-                      break
-                  if attempt["status"] not in retryable_analysis_statuses:
+
+                  def analyze_once():
+                      try:
+                          return app.do_analyze(cid)
+                      except Exception as exc:
+                          # Unexpected implementation/configuration errors are recorded and stop fallback.
+                          return {"status": "INTERNAL_ERROR", "detail": f"{type(exc).__name__}: {exc}"}
+
+                  candidate_statuses = analyze_with_invalid_output_retry(analyze_once, max_retries=1)
+                  for analysis_attempt, status in enumerate(candidate_statuses, start=1):
+                      saved_rows = app.store.analyses(cid)
+                      saved = saved_rows[0] if saved_rows else {}
+                      score = source.get("source_score") or {}
+                      score = score if isinstance(score, dict) else {}
+                      components = score.get("components") or {}
+                      components = components if isinstance(components, dict) else {}
+                      money_gate = components.get("money_signal_gate") or {}
+                      money_gate = money_gate if isinstance(money_gate, dict) else {}
+                      analysis = {"candidate_id": cid, "analysis_id": status.get("analysis_id"),
+                                  "status": status.get("status"), "selection_mode": selection_mode,
+                                  "source_use_policy": "STRICT_COMMERCIAL_ELIGIBILITY_FOR_AUTO_TRANSFER",
+                                  "commercial_gate_passed": bool(money_gate.get("pass")),
+                                  "source_relevance": (source.get("source_check") or {}).get("classification", "UNKNOWN"),
+                                  "source_score": score.get("final_score"),
+                                  "source_evidence_scope": "six sampled video frames only; mechanism and transferability remain hypotheses",
+                                  "result": saved.get("result"), "warnings": status.get("warnings", []),
+                                  "detail": status.get("detail", "")}
+                      attempt = {"candidate_id": cid, "status": str(status.get("status") or "UNKNOWN").upper(),
+                                 "detail": str(status.get("detail") or "")[:500]}
+                      if analysis_attempt > 1:
+                          attempt["same_candidate_retry"] = True
+                      attempts.append(attempt)
+                      print(f"Source analysis: candidate={cid} attempt={analysis_attempt} status={attempt['status']} detail={attempt['detail']}")
+                      final_status, final_analysis, final_saved = status, analysis, saved
+                      if attempt["status"] == "OK":
+                          selected_candidate = source
+                          break
+                      if attempt["status"] not in retryable_analysis_statuses:
+                          stop_candidate_search = True
+                          break
+                  if selected_candidate is not None or stop_candidate_search:
                       break
 
               attempt_artifact = {"selection_mode": selection_mode, "max_candidates": analysis_limit,
@@ -800,7 +811,7 @@ jobs:
                   summary.write(f"- Source score (metadata): {score.get('final_score')}\n")
                   summary.write(f"- Analysis attempts: {len(attempts)}\n")
                   summary.write("- Each source analysis attempt is recorded in source_analysis_attempts.json. Only a successful analysis is handed to production.\n\n")
-              from cme.radar.source_loop import run_source_loop
+              from cme.radar.source_loop import analyze_with_invalid_output_retry, run_source_loop
 
               initial_candidate, initial_cid = candidate, cid
               initial_status, initial_analysis, initial_saved = status, analysis, saved
@@ -812,7 +823,7 @@ jobs:
                   if str(item.get("id") or "").strip() not in already_analyzed
                   and str(item.get("id") or "").strip() != initial_cid
               ]
-              remaining_limit = max(1, analysis_limit - max(0, len(attempts) - 1))
+              remaining_limit = max(1, analysis_limit - max(0, len(already_analyzed) - 1))
 
               def analyze_for_transfer(source):
                   source_id = str(source.get("id") or "").strip()

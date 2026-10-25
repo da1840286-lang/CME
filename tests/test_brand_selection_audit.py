@@ -24,15 +24,18 @@ def atom(i, text, kind="qa_check", ch="qa", prio="MUST", shot=1):
 
 
 class SelectionOrderTests(unittest.TestCase):
-    def test_higher_score_wins_inside_the_weak_group_too(self):
-        # shape of the two live runs: a weak source with a high score used to sit behind a weak one with a low score
-        ordered, _ = rank_transfer_candidates([cand("a", 60.1, "EXPANDED"), cand("b", 28.3, gate=False, action="REJECT"),
-                                               cand("c", 51.6, gate=False, action="REJECT")])
-        self.assertEqual([c["id"] for c in ordered], ["a", "c", "b"])
+    def test_automatic_transfer_excludes_candidates_rejected_by_commercial_gate(self):
+        ordered, skipped = rank_transfer_candidates([cand("a", 60.1, "EXPANDED"), cand("b", 28.3, gate=False, action="REJECT"),
+                                                     cand("c", 51.6, gate=False, action="REJECT")])
+        self.assertEqual([c["id"] for c in ordered], ["a"])
+        self.assertEqual(len(skipped), 2)
+        self.assertTrue(any("REJECT" in reason for reason in skipped))
 
-    def test_a_clearly_higher_score_beats_the_commercial_bonus(self):
-        ordered, _ = rank_transfer_candidates([cand("strong", 55.6, "EXPANDED"), cand("weak_high", 61.7, gate=False, action="REJECT")])
-        self.assertEqual(ordered[0]["id"], "weak_high")
+    def test_high_score_cannot_override_a_commercial_rejection(self):
+        ordered, skipped = rank_transfer_candidates([cand("strong", 55.6, "EXPANDED"), cand("weak_high", 61.7, gate=False, action="REJECT")])
+        self.assertEqual([c["id"] for c in ordered], ["strong"])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("REJECT", skipped[0])
 
     def test_commercial_pass_breaks_a_close_call(self):
         ordered, _ = rank_transfer_candidates([cand("weak", 52.0, gate=False, action="REJECT"), cand("strong", 49.0)])
@@ -44,9 +47,15 @@ class SelectionOrderTests(unittest.TestCase):
 
     def test_unusable_sources_are_still_skipped_with_a_reason(self):
         novideo = {**cand("nv", 90.0), "video_url": ""}
-        chosen, skipped = select_transfer_candidate([novideo, cand("ok", 10.0, gate=False, action="REJECT")])
+        chosen, skipped = select_transfer_candidate([novideo, cand("ok", 10.0)])
         self.assertEqual(chosen["id"], "ok")
         self.assertEqual(len(skipped), 1)
+
+    def test_no_candidate_is_selected_when_every_source_fails_commercial_gate(self):
+        chosen, skipped = select_transfer_candidate([cand("rejected", 95.0, gate=False, action="REJECT")])
+        self.assertIsNone(chosen)
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("REJECT", skipped[0])
 
 
 class SystemOwnedChecksTests(unittest.TestCase):

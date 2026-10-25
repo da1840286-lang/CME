@@ -22,6 +22,27 @@ class LoopResult:
     last_payload: object = None
 
 
+def analyze_with_invalid_output_retry(analyze, *, max_retries=1) -> list:
+    """Retry the same analysis once only when the model output is invalid."""
+    try:
+        retries = max(0, int(max_retries))
+    except (TypeError, ValueError):
+        raise ValueError("max_retries must be a non-negative integer")
+
+    attempts = []
+    for _ in range(retries + 1):
+        try:
+            attempt = analyze()
+        except Exception as exc:
+            attempt = {"status": "INTERNAL_ERROR", "detail": f"{type(exc).__name__}: {exc}"}
+        if not isinstance(attempt, dict):
+            attempt = {"status": "UNKNOWN", "detail": "invalid analysis result"}
+        attempts.append(attempt)
+        if str(attempt.get("status") or "").upper() != "INVALID_OUTPUT":
+            break
+    return attempts
+
+
 def run_source_loop(pool, *, limit, analyze, produce, skip_reason=None,
                     allow_transfer_fallback=True, retryable=RETRYABLE_ANALYSIS, skipped=None) -> LoopResult:
     """Try candidates in rank order; only TRANSFER_REJECTED may trigger production fallback."""

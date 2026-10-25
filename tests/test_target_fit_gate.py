@@ -78,6 +78,35 @@ class TargetFitGateTests(unittest.TestCase):
         self.assertEqual(calls[0]["task"], "target_fit_gate")
         self.assertEqual(calls[0]["schema"]["properties"]["atoms"]["maxItems"], 0)
         self.assertIn("generic desire", " ".join(calls[0]["rules"]))
+        self.assertIn("does not require verified suction numbers", " ".join(calls[0]["rules"]))
+
+    def test_normal_visible_vacuum_demo_does_not_require_unverified_optional_specs(self):
+        response_decision = {
+            "transferable": True,
+            "abstract_mechanism": "Show visible crumbs, remove them, then reveal a clean patch",
+            "target_native_mapping": "Show crumbs on a car seat and one achievable cleaning pass",
+            "target_evidence": ["cordless handheld car vacuum"],
+            "reason": "A visible dry-debris demo is normal use and needs no unverified numeric claim",
+        }
+        calls = []
+
+        def call(request):
+            calls.append(request)
+            return {"atoms": [], "transfer_decision": response_decision}
+
+        result = request_transfer_fit(
+            target_offer(), "Show a visibly cleaner car seat", {
+                "format": "radar_analysis_hypothesis",
+                "buyer_problem": "Crumbs remain on a car seat",
+                "product_intervention": "A cordless handheld vacuum removes visible dry debris",
+                "result_demo": "The cleaned patch is visibly clearer than before",
+                "mechanism_hypothesis": "A visible action proves a practical cleaning result",
+            }, call,
+        )
+        self.assertTrue(result["transferable"])
+        rules = " ".join(calls[0]["rules"])
+        self.assertIn("does not require verified suction numbers", rules)
+        self.assertIn("unverified unique feature must be rejected", rules)
 
     def test_transferable_gate_requires_literal_target_offer_evidence(self):
         offer = target_offer()

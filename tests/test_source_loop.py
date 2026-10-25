@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from cme.brain import atom_budget_errors
-from cme.radar.source_loop import run_source_loop
+from cme.radar.source_loop import analyze_with_invalid_output_retry, run_source_loop
 
 
 def atom(atom_id, text, shot=1, kind="scene", priority="MUST", channel="image"):
@@ -61,6 +61,30 @@ class SourceLoopTests(unittest.TestCase):
 
         result = run_source_loop([{"id": cid} for cid in ids], limit=limit, analyze=analyze, produce=produce, **kwargs)
         return result, order
+
+    def test_invalid_output_retries_the_same_candidate_once(self):
+        calls = []
+        outcomes = [
+            {"status": "INVALID_OUTPUT", "detail": "invalid JSON"},
+            {"status": "OK", "detail": "valid on retry"},
+        ]
+
+        def analyze():
+            calls.append("candidate-a")
+            return outcomes.pop(0)
+
+        attempts = analyze_with_invalid_output_retry(analyze, max_retries=1)
+        self.assertEqual(calls, ["candidate-a", "candidate-a"])
+        self.assertEqual([a["status"] for a in attempts], ["INVALID_OUTPUT", "OK"])
+
+    def test_non_invalid_analysis_errors_are_not_retried(self):
+        calls = []
+        attempts = analyze_with_invalid_output_retry(
+            lambda: (calls.append("candidate-a") or {"status": "API_ERROR"}),
+            max_retries=1,
+        )
+        self.assertEqual(calls, ["candidate-a"])
+        self.assertEqual([a["status"] for a in attempts], ["API_ERROR"])
 
     def test_transfer_rejection_moves_to_next_ranked_candidate(self):
         result, order = self.run_loop(
